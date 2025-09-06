@@ -2,13 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 main.py
-Enhanced Foreclosure Sales Scraper with 30-Day Rolling Filter and New Record Highlighting
-Environment variables required:
-- SPREADSHEET_ID (Google Sheets ID)
-- Either:
-  - GOOGLE_CREDENTIALS_FILE (GitLab "File" variable path), OR
-  - GOOGLE_CREDENTIALS (raw JSON string), OR
-  - GOOGLE_CREDENTIALS (a path to a local JSON file)
+Foreclosure Sales Scraper with Rolling 30-Day Window
 """
 
 import os
@@ -17,13 +11,13 @@ import sys
 import json
 import asyncio
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse, parse_qs
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from zoneinfo import ZoneInfo
+
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # -----------------------------
@@ -51,14 +45,32 @@ POLITE_DELAY_SECONDS = 1.5
 MAX_RETRIES = 5
 
 # -----------------------------
+# EST Timezone Helper
+# -----------------------------
+def get_est_time():
+    """Get current time in EST timezone"""
+    est = timezone(timedelta(hours=-5))  # EST is UTC-5
+    return datetime.now(est)
+
+def get_est_date():
+    """Get current date in EST timezone"""
+    return get_est_time().date()
+
+def parse_sale_date(date_str):
+    """Parse sale date string into datetime object"""
+    try:
+        # Handle formats like "09/08/2025 2:00 PM"
+        if " " in date_str:
+            return datetime.strptime(date_str, "%m/%d/%Y %I:%M %p")
+        # Handle formats like "09/08/2025"
+        else:
+            return datetime.strptime(date_str, "%m/%d/%Y")
+    except (ValueError, TypeError):
+        return None
+
+# -----------------------------
 # Credential helpers
 # -----------------------------
-def get_est_datetime():
-    """
-    Returns current datetime in Eastern Time (EST/EDT automatically handled).
-    Requires Python 3.9+ for zoneinfo.
-    """
-    return datetime.now(ZoneInfo("America/New_York"))
 def load_service_account_info():
     """
     Loads service account JSON from:
@@ -110,59 +122,7 @@ def init_sheets_service_from_env():
         raise RuntimeError(f"Failed to create Google Sheets client: {e}")
 
 # -----------------------------
-# Date utilities
-# -----------------------------
-def parse_sale_date(date_str):
-    """Parse various date formats and return datetime object."""
-    if not date_str:
-        return None
-    
-    # Clean the date string
-    date_str = date_str.strip()
-    
-    # Common formats found in the data
-    formats = [
-        "%m/%d/%Y %I:%M %p",  # 09/08/2025 2:00 PM
-        "%m/%d/%Y",           # 09/08/2025
-        "%Y-%m-%d %H:%M:%S",  # 2025-09-08 14:00:00
-        "%Y-%m-%d",           # 2025-09-08
-        "%m-%d-%Y",           # 09-08-2025
-        "%d/%m/%Y",           # 08/09/2025 (day/month/year)
-    ]
-    
-    for fmt in formats:
-        try:
-            return datetime.strptime(date_str, fmt)
-        except ValueError:
-            continue
-    
-    # Try to extract just the date part if there's extra text
-    date_match = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{4})', date_str)
-    if date_match:
-        date_part = date_match.group(1)
-        for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y"]:
-            try:
-                return datetime.strptime(date_part, fmt)
-            except ValueError:
-                continue
-    
-    return None
-
-def is_within_30_days(sale_date_str, reference_date=None):
-    """Check if sale date is within next 30 days from reference date."""
-    if reference_date is None:
-        reference_date = datetime.now()
-    
-    sale_date = parse_sale_date(sale_date_str)
-    if not sale_date:
-        return False
-    
-    # Check if sale date is within the next 30 days
-    end_date = reference_date + timedelta(days=29)  # 30 days including today
-    return reference_date.date() <= sale_date.date() <= end_date.date()
-
-# -----------------------------
-# Enhanced Sheets client wrapper
+# Sheets client wrapper
 # -----------------------------
 class SheetsClient:
     def __init__(self, spreadsheet_id: str, service):
@@ -215,6 +175,37 @@ class SheetsClient:
                 valueInputOption="USER_ENTERED",
                 body={"values": values}
             ).execute()
+
+            # --- Beautify: bold header, freeze row, auto resize ---
+            self.svc.batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body={
+                    "requests": [
+                        {"repeatCell": {
+                            "range": {
+                                "sheetId": self._get_sheet_id(sheet_name),
+                                "startRowIndex": 1,
+                                "endRowIndex": 2
+                            },
+                            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                            "fields": "userEnteredFormat.textFormat.bold"
+                        }},
+                        {"updateSheetProperties": {
+                            "properties": {"sheetId": self._get_sheet_id(sheet_name),
+                                           "gridProperties": {"frozenRowCount": 2}},
+                            "fields": "gridProperties.frozenRowCount"
+                        }},
+                        {"autoResizeDimensions": {
+                            "dimensions": {
+                                "sheetId": self._get_sheet_id(sheet_name),
+                                "dimension": "COLUMNS",
+                                "startIndex": 0,
+                                "endIndex": len(values[0]) if values else 10
+                            }
+                        }}
+                    ]
+                }
+            ).execute()
         except HttpError as e:
             print(f"✗ write_values error on '{sheet_name}': {e}")
             raise
@@ -226,204 +217,188 @@ class SheetsClient:
                 return s['properties']['sheetId']
         return None
 
-    def apply_formatting_and_highlighting(self, sheet_name: str, header_row, all_rows, new_property_ids):
-        """Apply formatting, freeze header, and highlight new records."""
-        try:
-            sheet_id = self._get_sheet_id(sheet_name)
-            if sheet_id is None:
-                print(f"⚠ Could not find sheet ID for '{sheet_name}'")
-                return
-
-            requests = []
+    def highlight_new_rows(self, sheet_name: str, new_row_indices: list):
+        """Apply green background to new rows"""
+        if not new_row_indices:
+            return
             
-            # 1. Bold and freeze header row (row 2, since row 1 is snapshot title)
+        sheet_id = self._get_sheet_id(sheet_name)
+        if sheet_id is None:
+            return
+            
+        requests = []
+        for row_idx in new_row_indices:
             requests.append({
                 "repeatCell": {
                     "range": {
                         "sheetId": sheet_id,
-                        "startRowIndex": 1,
-                        "endRowIndex": 2
+                        "startRowIndex": row_idx,
+                        "endRowIndex": row_idx + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 10  # Adjust based on number of columns
                     },
-                    "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
-                    "fields": "userEnteredFormat.textFormat.bold"
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": {
+                                "red": 0.85,
+                                "green": 0.92,
+                                "blue": 0.83
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat.backgroundColor"
                 }
             })
             
-            requests.append({
-                "updateSheetProperties": {
-                    "properties": {
-                        "sheetId": sheet_id,
-                        "gridProperties": {"frozenRowCount": 2}
-                    },
-                    "fields": "gridProperties.frozenRowCount"
-                }
-            })
+        try:
+            self.svc.batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body={"requests": requests}
+            ).execute()
+            print(f"✓ Highlighted {len(new_row_indices)} new rows in '{sheet_name}'")
+        except HttpError as e:
+            print(f"⚠ Error highlighting rows in '{sheet_name}': {e}")
 
-            # 2. Auto-resize columns
-            num_cols = len(header_row) if header_row else 10
-            requests.append({
-                "autoResizeDimensions": {
-                    "dimensions": {
+    def apply_rolling_30_day_filter(self, sheet_name: str, sales_date_column_idx: int = 3):
+        """
+        Apply a rolling 30-day filter that advances by one day each day
+        based on the minimum sale date in the data
+        """
+        sheet_id = self._get_sheet_id(sheet_name)
+        if sheet_id is None:
+            return
+            
+        # Get all values from the sheet
+        all_values = self.get_values(sheet_name, "A:Z")
+        if not all_values or len(all_values) < 3:  # Need at least header + 1 data row
+            print(f"⚠ Not enough data in '{sheet_name}' to apply 30-day filter")
+            return
+            
+        # Find the header row and data rows
+        header_row_idx = None
+        for i, row in enumerate(all_values):
+            if row and row[0] and "Snapshot for" in row[0]:
+                # Next row should be the header
+                if i + 1 < len(all_values) and all_values[i + 1]:
+                    header_row_idx = i + 1
+                    break
+                    
+        if header_row_idx is None:
+            print(f"⚠ Could not find header row in '{sheet_name}'")
+            return
+            
+        # Extract sale dates from the data
+        sale_dates = []
+        for i in range(header_row_idx + 1, len(all_values)):
+            row = all_values[i]
+            if not row or len(row) <= sales_date_column_idx:
+                continue
+                
+            date_str = row[sales_date_column_idx]
+            sale_date = parse_sale_date(date_str)
+            if sale_date:
+                sale_dates.append(sale_date)
+                
+        if not sale_dates:
+            print(f"⚠ No valid sale dates found in '{sheet_name}'")
+            return
+            
+        # Find the minimum sale date in EST
+        min_sale_date = min(sale_dates)
+        # Convert to EST date (if not already in EST)
+        min_sale_date_est = min_sale_date.astimezone(timezone(timedelta(hours=-5))).date()
+        
+        # Get today's date in EST
+        today_est = get_est_date()
+        
+        # Calculate days elapsed since the minimum sale date
+        days_elapsed = (today_est - min_sale_date_est).days
+        
+        # Calculate the start date for the filter (min date + days elapsed)
+        start_date = min_sale_date_est + timedelta(days=days_elapsed)
+        
+        # Calculate end date (30 days from the start date)
+        end_date = start_date + timedelta(days=30)
+        
+        # Format dates for comparison
+        start_date_str = start_date.strftime("%m/%d/%Y")
+        end_date_str = end_date.strftime("%m/%d/%Y")
+        
+        # Create filter request
+        requests = [{
+            "setBasicFilter": {
+                "filter": {
+                    "range": {
                         "sheetId": sheet_id,
-                        "dimension": "COLUMNS",
-                        "startIndex": 0,
-                        "endIndex": num_cols
+                        "startRowIndex": header_row_idx,  # Start from header row
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 10  # Adjust based on number of columns
+                    },
+                    "criteria": {
+                        sales_date_column_idx: {  # Sales Date column
+                            "condition": {
+                                "type": "DATE_BETWEEN",
+                                "values": [
+                                    {"userEnteredValue": start_date_str},
+                                    {"userEnteredValue": end_date_str}
+                                ]
+                            }
+                        }
                     }
                 }
-            })
-
-            # 3. Highlight new records (light green background)
-            if new_property_ids and all_rows:
-                for row_idx, row in enumerate(all_rows):
-                    if row and len(row) > 0:
-                        property_id = row[0]  # Property ID is first column
-                        if property_id in new_property_ids:
-                            # Row index in sheet (add 2 because: 0-indexed + snapshot title + header)
-                            sheet_row_idx = row_idx + 2
-                            requests.append({
-                                "repeatCell": {
-                                    "range": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": sheet_row_idx,
-                                        "endRowIndex": sheet_row_idx + 1,
-                                        "startColumnIndex": 0,
-                                        "endColumnIndex": num_cols
-                                    },
-                                    "cell": {
-                                        "userEnteredFormat": {
-                                            "backgroundColor": {
-                                                "red": 0.85,
-                                                "green": 0.95,
-                                                "blue": 0.85
-                                            }
-                                        }
-                                    },
-                                    "fields": "userEnteredFormat.backgroundColor"
-                                }
-                            })
-
-            if requests:
-                self.svc.batchUpdate(
-                    spreadsheetId=self.spreadsheet_id,
-                    body={"requests": requests}
-                ).execute()
-                
-                if new_property_ids:
-                    print(f"✓ Highlighted {len(new_property_ids)} new records in '{sheet_name}'")
-
+            }
+        }]
+        
+        try:
+            self.svc.batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body={"requests": requests}
+            ).execute()
+            print(f"✓ Applied rolling 30-day filter to '{sheet_name}' (EST: {start_date_str} to {end_date_str})")
         except HttpError as e:
-            print(f"✗ Formatting error on '{sheet_name}': {e}")
+            print(f"⚠ Error applying filter to '{sheet_name}': {e}")
 
-    def get_previous_snapshot_property_ids(self, sheet_name: str):
-        """Extract Property IDs from the previous snapshot (before the latest one)."""
+    # --- snapshot style: prepend only new rows ---
+    def prepend_snapshot(self, sheet_name: str, header_row, new_rows, new_row_indices=None):
+        if not new_rows:
+            print(f"✓ No new rows to prepend in '{sheet_name}'")
+            return
+            
+        # Use EST time for snapshot header
+        est_now = get_est_time()
+        snapshot_header = [[f"Snapshot for {est_now.strftime('%A - %Y-%m-%d')}"]]
+        payload = snapshot_header + [header_row] + new_rows + [[""]]
         existing = self.get_values(sheet_name, "A:Z")
-        if not existing:
-            return set()
-        
-        property_ids = set()
-        current_snapshot_found = False
-        in_previous_snapshot = False
-        
-        for row in existing:
-            if not row:
-                continue
-                
-            # Check if this is a snapshot header
-            if len(row) > 0 and row[0].startswith("Snapshot for"):
-                if not current_snapshot_found:
-                    # This is the current (latest) snapshot
-                    current_snapshot_found = True
-                    in_previous_snapshot = False
-                else:
-                    # This is the previous snapshot
-                    in_previous_snapshot = True
-                continue
-            
-            # Check if this is a data header row
-            if row and len(row) > 0 and row[0].lower().replace(" ", "") in {"propertyid", "property id"}:
-                continue
-            
-            # Check for empty separator rows
-            if len(row) == 1 and row[0].strip() == "":
-                if in_previous_snapshot:
-                    break  # End of previous snapshot
-                continue
-            
-            # Collect property IDs from previous snapshot
-            if in_previous_snapshot and row and len(row) > 0:
-                property_id = row[0].strip()
-                if property_id:
-                    property_ids.add(property_id)
-        
-        return property_ids
-
-    def write_full_snapshot_with_filter(self, sheet_name: str, header_row, all_rows, county_name=""):
-        """Write full snapshot but show only records within next 30 days for county sheets."""
-        current_date = datetime.now()
-        snapshot_header = [[f"Snapshot for {current_date.strftime('%A - %Y-%m-%d')}"]]
-        
-        # Get previous snapshot property IDs for highlighting
-        previous_property_ids = self.get_previous_snapshot_property_ids(sheet_name)
-        
-        if sheet_name == "All Data":
-            # All Data sheet: show everything, no filtering
-            filtered_rows = all_rows
-            new_property_ids = set()
-            for row in all_rows:
-                if row and len(row) > 0:
-                    property_id = row[0]
-                    if property_id not in previous_property_ids:
-                        new_property_ids.add(property_id)
-        else:
-            # County sheets: apply 30-day filter
-            filtered_rows = []
-            new_property_ids = set()
-            
-            # Find Sales Date column index
-            sales_date_idx = None
-            if "Sales Date" in header_row:
-                sales_date_idx = header_row.index("Sales Date")
-            elif "Sale Date" in header_row:
-                sales_date_idx = header_row.index("Sale Date")
-            
-            for row in all_rows:
-                if not row or len(row) == 0:
-                    continue
-                    
-                # Check if within 30 days
-                include_row = True
-                if sales_date_idx is not None and len(row) > sales_date_idx:
-                    sale_date = row[sales_date_idx]
-                    include_row = is_within_30_days(sale_date, current_date)
-                
-                if include_row:
-                    filtered_rows.append(row)
-                    # Check if this is a new record
-                    property_id = row[0]
-                    if property_id not in previous_property_ids:
-                        new_property_ids.add(property_id)
-
-        # Prepare final data structure
-        values = snapshot_header + [header_row] + filtered_rows + [[""]]
-        
-        # Clear and write
+        values = payload + existing
         self.clear(sheet_name, "A:Z")
         self.write_values(sheet_name, values, "A1")
         
-        # Apply formatting and highlighting
-        self.apply_formatting_and_highlighting(sheet_name, header_row, filtered_rows, new_property_ids)
+        # Highlight new rows if indices are provided
+        if new_row_indices:
+            # Adjust indices for the new rows we just added
+            adjusted_indices = [idx + len(snapshot_header) + 1 for idx in new_row_indices]
+            self.highlight_new_rows(sheet_name, adjusted_indices)
+            
+        # Apply rolling 30-day filter based on the data in the sheet
+        # Sales Date is typically in column D (index 3)
+        self.apply_rolling_30_day_filter(sheet_name, sales_date_column_idx=3)
         
-        # Print summary
-        filter_msg = ""
-        if sheet_name != "All Data":
-            total_records = len(all_rows)
-            shown_records = len(filtered_rows)
-            filter_msg = f" (showing {shown_records}/{total_records} within 30 days)"
+        print(f"✓ Prepended snapshot to '{sheet_name}': {len(new_rows)} new rows")
+
+    # first run = full overwrite
+    def overwrite_with_snapshot(self, sheet_name: str, header_row, all_rows):
+        # Use EST time for snapshot header
+        est_now = get_est_time()
+        snapshot_header = [[f"Snapshot for {est_now.strftime('%A - %Y-%m-%d')}"]]
+        values = snapshot_header + [header_row] + all_rows + [[""]]
+        self.clear(sheet_name, "A:Z")
+        self.write_values(sheet_name, values, "A1")
         
-        new_count = len(new_property_ids)
-        new_msg = f", {new_count} new" if new_count > 0 else ""
+        # Apply rolling 30-day filter based on the data in the sheet
+        # Sales Date is typically in column D (index 3)
+        self.apply_rolling_30_day_filter(sheet_name, sales_date_column_idx=3)
         
-        print(f"✓ Updated '{sheet_name}': {len(filtered_rows)} records{filter_msg}{new_msg}")
+        print(f"✓ Wrote full snapshot to '{sheet_name}' ({len(all_rows)} rows)")
 
 # -----------------------------
 # Scrape helpers
@@ -659,9 +634,8 @@ class ForeclosureScraper:
 # Orchestration
 # -----------------------------
 async def run():
-    start_ts = get_est_datetime()  # Use EST timezone
-    print(f"▶ Starting enhanced scrape at {start_ts}")
-    print(f"📅 30-day window: {start_ts.strftime('%Y-%m-%d')} to {(start_ts + timedelta(days=29)).strftime('%Y-%m-%d')} (EST)")
+    start_ts = get_est_time()
+    print(f"▶ Starting scrape at {start_ts.strftime('%Y-%m-%d %H:%M:%S %Z')} (EST)")
 
     spreadsheet_id = os.environ.get("SPREADSHEET_ID")
     if not spreadsheet_id:
@@ -677,6 +651,8 @@ async def run():
 
     sheets = SheetsClient(spreadsheet_id, service)
     ALL_DATA_SHEET = "All Data"
+    first_run = not sheets.sheet_exists(ALL_DATA_SHEET)
+    print(f"ℹ First run? {'YES' if first_run else 'NO'}")
 
     all_data_rows = []
 
@@ -696,70 +672,147 @@ async def run():
 
                 df_county = pd.DataFrame(county_records)
 
-                # Dynamic header (skip County col for individual county sheets)
+                # dynamic header (skip County col)
                 county_columns = [col for col in df_county.columns if col != "County"]
                 county_header = county_columns
 
-                # Create county sheet and write full snapshot with 30-day filter
-                sheets.create_sheet_if_missing(county_tab)
-                rows = df_county.drop(columns=["County"]).astype(str).values.tolist()
-                sheets.write_full_snapshot_with_filter(county_tab, county_header, rows, county['county_name'])
+                if first_run or not sheets.sheet_exists(county_tab):
+                    sheets.create_sheet_if_missing(county_tab)
+                    rows = df_county.drop(columns=["County"]).astype(str).values.tolist()
+                    sheets.overwrite_with_snapshot(county_tab, county_header, rows)
+                else:
+                    existing = sheets.get_values(county_tab, "A:Z")
+                    existing_ids = set()
+                    existing_snapshot_data = []
+                    if existing:
+                        # Find the most recent snapshot
+                        snapshot_start = None
+                        header_idx = None
+                        
+                        # Look for snapshot header
+                        for idx, row in enumerate(existing):
+                            if row and row[0].startswith("Snapshot for"):
+                                snapshot_start = idx
+                                # Next row should be the header
+                                if idx + 1 < len(existing) and existing[idx + 1]:
+                                    header_idx = idx + 1
+                                break
+                                
+                        if header_idx is not None and header_idx + 1 < len(existing):
+                            # Extract data from the most recent snapshot
+                            for r in existing[header_idx + 1:]:
+                                if not r or (len(r) == 1 and r[0].strip() == ""):
+                                    break
+                                pid = (r[0] or "").strip()
+                                if pid:
+                                    existing_ids.add(pid)
+                                    existing_snapshot_data.append(r)
 
-                # Add to all data collection
+                    # Identify new rows
+                    new_df = df_county[~df_county["Property ID"].isin(existing_ids)].copy()
+                    
+                    # Get indices of new rows for highlighting
+                    new_row_indices = []
+                    for i, row in df_county.iterrows():
+                        if row["Property ID"] not in existing_ids:
+                            new_row_indices.append(i)
+                    
+                    if new_df.empty:
+                        print(f"✓ No new rows for {county['county_name']}")
+                    else:
+                        new_rows = new_df.drop(columns=["County"]).astype(str).values.tolist()
+                        sheets.prepend_snapshot(county_tab, county_header, new_rows, new_row_indices)
+
                 all_data_rows.extend(df_county.astype(str).values.tolist())
+                print(f"✓ Completed {county['county_name']}: {len(df_county)} records")
                 await asyncio.sleep(POLITE_DELAY_SECONDS)
-                
             except Exception as e:
                 print(f"❌ Failed county '{county['county_name']}': {e}")
                 continue
 
         await browser.close()
 
-    # --- All Data sheet (no 30-day filter, shows everything) ---
+    # --- All Data sheet ---
     try:
         if not all_data_rows:
             print("⚠ No data scraped across all counties. Skipping 'All Data'.")
         else:
-            # Standard columns
+            # default columns
             standard_cols = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment", "County"]
 
-            # Check if we have New Castle County data (adds Sale Type column)
+            # New Castle adds Sale Type
             has_new_castle = any(county["county_id"] == "24" for county in TARGET_COUNTIES)
             if has_new_castle:
+                # Force Sale Type to always be last
                 header_all = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment", "County", "Sale Type"]
                 padded_rows = []
                 for row in all_data_rows:
                     if len(row) == 6:  # no Sale Type
-                        padded_row = row[:5] + [row[5]] + [""]  # Add empty Sale Type
+                        # row = [PID, Addr, Def, Date, Judgment, County]
+                        padded_row = row[:5] + [row[5]] + [""]
                         padded_rows.append(padded_row)
                     elif len(row) == 7:
-                        padded_rows.append(row)
+                        # Ensure Sale Type is last
+                        padded_row = row[:5] + [row[5]] + [row[6]]
+                        padded_rows.append(padded_row)
                     else:
-                        # Handle any other row lengths
-                        while len(row) < 7:
-                            row.append("")
-                        padded_rows.append(row[:7])
+                        padded_rows.append(row)
                 all_data_rows = padded_rows
             else:
                 header_all = standard_cols
 
-            # Create and update All Data sheet (no filtering - shows all records)
             sheets.create_sheet_if_missing(ALL_DATA_SHEET)
-            sheets.write_full_snapshot_with_filter(ALL_DATA_SHEET, header_all, all_data_rows)
+            if first_run:
+                sheets.overwrite_with_snapshot(ALL_DATA_SHEET, header_all, all_data_rows)
+            else:
+                existing = sheets.get_values(ALL_DATA_SHEET, "A:Z")
+                existing_pairs = set()
+                existing_snapshot_data = []
+                if existing:
+                    # Find the most recent snapshot
+                    snapshot_start = None
+                    header_idx = None
+                    
+                    # Look for snapshot header
+                    for idx, row in enumerate(existing):
+                        if row and row[0].startswith("Snapshot for"):
+                            snapshot_start = idx
+                            # Next row should be the header
+                            if idx + 1 < len(existing) and existing[idx + 1]:
+                                header_idx = idx + 1
+                            break
+                            
+                    if header_idx is not None and header_idx + 1 < len(existing):
+                        # Extract data from the most recent snapshot
+                        for r in existing[header_idx + 1:]:
+                            if not r or (len(r) == 1 and r[0].strip() == ""):
+                                break
+                            pid = (r[0] if len(r) > 0 else "").strip()
+                            county_col_idx = 5  # county is always before Sale Type now
+                            cty = (r[county_col_idx] if len(r) > county_col_idx else "").strip()
+                            if pid and cty:
+                                existing_pairs.add((cty, pid))
+                                existing_snapshot_data.append(r)
 
+                # Identify new rows
+                new_rows = []
+                new_row_indices = []
+                for idx, r in enumerate(all_data_rows):
+                    pid = (r[0] if len(r) > 0 else "").strip()
+                    county_col_idx = 5
+                    cty = (r[county_col_idx] if len(r) > county_col_idx else "").strip()
+                    if pid and cty and (cty, pid) not in existing_pairs:
+                        new_rows.append(r)
+                        new_row_indices.append(idx)
+
+                if not new_rows:
+                    print("✓ No new rows for 'All Data'")
+                else:
+                    sheets.prepend_snapshot(ALL_DATA_SHEET, header_all, new_rows, new_row_indices)
+                    print(f"✓ All Data updated: {len(new_rows)} new rows")
     except Exception as e:
         print(f"✗ Error updating 'All Data': {e}")
 
-    # Summary
-    end_ts = get_est_datetime()
-    duration = (end_ts - start_ts).total_seconds()
-    total_records = len(all_data_rows)
-    
-    print(f"\n🎯 Scrape completed in {duration:.1f}s")
-    print(f"📊 Total records processed: {total_records}")
-    print(f"📅 Each county shows 30 days from its minimum sale date (purely data-based)")
-    print(f"🗂️  'All Data' sheet contains all records (no date filtering)")
-    print(f"🎨 New records highlighted in light green")
 
 
 if __name__ == "__main__":
