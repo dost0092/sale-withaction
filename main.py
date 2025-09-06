@@ -19,6 +19,8 @@ import asyncio
 import pandas as pd
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse, parse_qs
+from zoneinfo import ZoneInfo
+
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -53,6 +55,12 @@ MAX_RETRIES = 5
 # -----------------------------
 # Credential helpers
 # -----------------------------
+def get_est_datetime():
+    """
+    Returns current datetime in Eastern Time (EST/EDT automatically handled).
+    Requires Python 3.9+ for zoneinfo.
+    """
+    return datetime.now(ZoneInfo("America/New_York"))
 def load_service_account_info():
     """
     Loads service account JSON from:
@@ -653,9 +661,9 @@ class ForeclosureScraper:
 # Orchestration
 # -----------------------------
 async def run():
-    start_ts = datetime.now()
+    start_ts = get_est_datetime()  # Use EST timezone
     print(f"▶ Starting enhanced scrape at {start_ts}")
-    print(f"📅 30-day window: {start_ts.strftime('%Y-%m-%d')} to {(start_ts + timedelta(days=29)).strftime('%Y-%m-%d')}")
+    print(f"📅 30-day window: {start_ts.strftime('%Y-%m-%d')} to {(start_ts + timedelta(days=29)).strftime('%Y-%m-%d')} (EST)")
 
     spreadsheet_id = os.environ.get("SPREADSHEET_ID")
     if not spreadsheet_id:
@@ -745,15 +753,15 @@ async def run():
         print(f"✗ Error updating 'All Data': {e}")
 
     # Summary
-    end_ts = datetime.now()
+    end_ts = get_est_datetime()
     duration = (end_ts - start_ts).total_seconds()
     total_records = len(all_data_rows)
     
     print(f"\n🎯 Scrape completed in {duration:.1f}s")
-    print(f"📊 Total records processed: {total_records}")
-    print(f"📅 County sheets show next 30 days ({start_ts.strftime('%Y-%m-%d')} to {(start_ts + timedelta(days=29)).strftime('%Y-%m-%d')})")
-    print(f"🗂️  'All Data' sheet contains all records (no date filtering)")
-    print(f"🎨 New records highlighted in light green")
+    print(f" Total records processed: {total_records}")
+    print(f" Each county uses data-dependent rolling 30-day window (auto-advances daily)")
+    print(f"  'All Data' sheet contains all records (no date filtering)")
+    print(f" New records highlighted in light green")
 
 
 if __name__ == "__main__":
