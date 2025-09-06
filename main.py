@@ -221,23 +221,55 @@ class SheetsClient:
         print(f"✓ Wrote full snapshot to '{sheet_name}' ({len(all_rows)} rows)")
 
     # ---------- formatting helpers for highlighting ----------
-    def clear_highlight_formatting(self, sheet_name: str):
+    def clear_highlight_formatting(self, sheet_name: str, row_ranges=None):
+        """
+        Clear direct background fills. If row_ranges is provided, only clear in those ranges.
+        Otherwise clears a default wide area.
+        """
         try:
             sheet_id = self._get_sheet_id(sheet_name)
             if sheet_id is None:
                 return
-            # Remove all previous conditional formats
-            self.svc.batchUpdate(
-                spreadsheetId=self.spreadsheet_id,
-                body={"requests": [{"deleteConditionalFormatRule": {"index": 0, "sheetId": sheet_id}} for _ in range(100)]}
-            ).execute()
-        except HttpError:
-            pass  # ignore if none
+            requests = []
+            if row_ranges:
+                for (r0, r1, c0, c1) in row_ranges:
+                    requests.append({
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": r0,
+                                "endRowIndex": r1,
+                                "startColumnIndex": c0,
+                                "endColumnIndex": c1
+                            },
+                            "cell": {"userEnteredFormat": {"backgroundColor": None}},
+                            "fields": "userEnteredFormat.backgroundColor"
+                        }
+                    })
+            else:
+                # Fallback: clear first 2000 rows x 30 columns
+                requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 0,
+                            "endRowIndex": 2000,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 30
+                        },
+                        "cell": {"userEnteredFormat": {"backgroundColor": None}},
+                        "fields": "userEnteredFormat.backgroundColor"
+                    }
+                })
+            if requests:
+                self.svc.batchUpdate(spreadsheetId=self.spreadsheet_id, body={"requests": requests}).execute()
+        except HttpError as e:
+            print(f"⚠ clear_highlight_formatting failed on '{sheet_name}': {e}")
 
     def apply_highlight_for_rows(self, sheet_name: str, row_ranges):
         """
-        row_ranges: list of (start_row, end_row, start_col, end_col) in 0-based indices, end exclusive.
-        Applies a light green fill to those ranges using conditional formatting rules.
+        Apply direct background fills to the specified row ranges.
+        row_ranges: list of (start_row, end_row, start_col, end_col) 0-based, end exclusive.
         """
         if not row_ranges:
             return
@@ -247,21 +279,16 @@ class SheetsClient:
         requests = []
         for (r0, r1, c0, c1) in row_ranges:
             requests.append({
-                "addConditionalFormatRule": {
-                    "rule": {
-                        "ranges": [{
-                            "sheetId": sheet_id,
-                            "startRowIndex": r0,
-                            "endRowIndex": r1,
-                            "startColumnIndex": c0,
-                            "endColumnIndex": c1
-                        }],
-                        "booleanRule": {
-                            "condition": {"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": "=TRUE"}]},
-                            "format": {"backgroundColor": {"red": 0.85, "green": 0.94, "blue": 0.85}}
-                        }
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": r0,
+                        "endRowIndex": r1,
+                        "startColumnIndex": c0,
+                        "endColumnIndex": c1
                     },
-                    "index": 0
+                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.85, "green": 0.94, "blue": 0.85}}},
+                    "fields": "userEnteredFormat.backgroundColor"
                 }
             })
         try:
@@ -578,7 +605,7 @@ def collect_row_ranges_for_new_rows(values, block, key_fn, old_keys):
     """
     Return list of (start_row, end_row, start_col, end_col) for highlight.
     """
-    # full width: from col 0 to last non-empty in headers
+    # full width: from col 0 to last non-empty in headers or data
     end_col = max(len(block["headers"]), max((len(values[r]) for r in range(block["data_start_row"], block["data_end_row"])), default=0))
     ranges = []
     for r in range(block["data_start_row"], block["data_end_row"]):
@@ -616,6 +643,7 @@ def apply_snapshot_highlighting(sheets: SheetsClient, sheet_name: str, all_value
     """
     key_mode: "county" or "all"
     Compares latest snapshot against immediately previous snapshot and highlights new rows in the latest.
+    Applies direct background fills (no conditional formatting rules).
     """
     blocks = find_snapshot_blocks(all_values)
     if not blocks:
@@ -630,8 +658,12 @@ def apply_snapshot_highlighting(sheets: SheetsClient, sheet_name: str, all_value
     # Determine new rows in the latest block
     ranges = collect_row_ranges_for_new_rows(all_values, latest, key_fn, old_keys)
 
-    # Clear ALL conditional formats, then apply only for the latest block new rows
-    sheets.clear_highlight_formatting(sheet_name)
+    # Clear fills in the latest data block first, then apply only for new rows
+    full_width = max(len(latest["headers"]),
+                     max((len(all_values[r]) for r in range(latest["data_start_row"], latest["data_end_row"])), default=0))
+    if full_width == 0:
+        full_width = 30  # safe default
+    sheets.clear_highlight_formatting(sheet_name, row_ranges=[(latest["data_start_row"], latest["data_end_row"], 0, full_width)])
     sheets.apply_highlight_for_rows(sheet_name, ranges)
 
 # -----------------------------
