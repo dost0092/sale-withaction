@@ -1,51 +1,95 @@
-steps:
-  - name: Checkout
-    uses: actions/checkout@v4
+name: Sales With Action
 
-  - name: Set up Python
-    uses: actions/setup-python@v5
-    with:
-        python-version: "3.11"
+on:
+  # Manual run
+  workflow_dispatch: {}
+  # Scheduled daily run at 07:05 UTC (adjust as needed)
+  schedule:
+    - cron: "30 14 * * *"
 
-  - name: Cache pip
-    uses: actions/cache@v4
-    with:
-      path: ~/.cache/pip
-      key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-      restore-keys: |
-        ${{ runner.os }}-pip-
+permissions:
+  contents: read
 
-  - name: Install dependencies
-    run: |
-      python -m pip install --upgrade pip
-      pip install -r requirements.txt
+jobs:
+  test_credentials:
+    name: Test Google Auth
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
-  - name: Install Playwright browsers
-    run: |
-      python -m playwright install --with-deps chromium
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-  # Optional: Show disk and env context (for debugging)
-  - name: Env context
-    run: |
-      python -V
-      which python
-      pip -V
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-  - name: Run scraper (attempt 1)
-    env:
-      SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-    run: |
-      set -e
-      python main.py
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-  # Optional automatic retry once if it fails due to transient issues
-  - name: Retry on failure (attempt 2)
-    if: failure()
-    env:
-      SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-    run: |
-      echo "Retrying after 60s..."
-      sleep 60
-      python main.py
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Run credential test
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: |
+          echo "▶ Verifying Google Sheets credentials..."
+          python test_google_auth.py
+
+  scrape_foreclosures:
+    name: Scrape Foreclosure Sales
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [test_credentials]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Run scraper (attempt 1)
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          # Optional: tune your scraper via env if you add flags
+          # POLITE_DELAY_SECONDS: "1.5"
+        run: |
+          echo "▶ Running foreclosure scraper..."
+          python main.py
+
+      - name: Retry on failure (attempt 2
