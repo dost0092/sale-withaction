@@ -1,0 +1,45 @@
+# image: python:3.9
+
+# stages:
+#   - run
+
+# before_script:
+#   - python --version
+#   - pip install --upgrade pip
+#   - pip install -r requirements.txt
+
+# scrape_and_update:
+#   stage: run
+#   script:
+#     - python scrape_and_update.py
+
+stages:
+  - test
+  - scrape
+
+variables:
+  # Keep SPREADSHEET_ID set as a project variable (masked/protected as needed)
+  SPREADSHEET_ID: "$SPREADSHEET_ID"
+
+# Test job: verify credentials are present & valid
+test_credentials:
+  stage: test
+  image: mcr.microsoft.com/playwright/python:v1.48.0-jammy
+  script:
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+    - python test_google_auth.py
+  only:
+    - main
+
+scrape_foreclosures:
+  stage: scrape
+  image: mcr.microsoft.com/playwright/python:v1.54.0-jammy
+  before_script:
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+  script:
+    - echo "▶ Running foreclosure scraper..."
+    - python main.py
+  only:
+    - main
