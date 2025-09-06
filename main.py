@@ -19,13 +19,11 @@ import asyncio
 import pandas as pd
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse, parse_qs
-from zoneinfo import ZoneInfo
-
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-
+from zoneinfo import ZoneInfo
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # -----------------------------
@@ -758,10 +756,10 @@ async def run():
     total_records = len(all_data_rows)
     
     print(f"\n🎯 Scrape completed in {duration:.1f}s")
-    print(f" Total records processed: {total_records}")
-    print(f" Each county uses data-dependent rolling 30-day window (auto-advances daily)")
-    print(f"  'All Data' sheet contains all records (no date filtering)")
-    print(f" New records highlighted in light green")
+    print(f"📊 Total records processed: {total_records}")
+    print(f"📅 Each county shows 30 days from its minimum sale date (purely data-based)")
+    print(f"🗂️  'All Data' sheet contains all records (no date filtering)")
+    print(f"🎨 New records highlighted in light green")
 
 
 if __name__ == "__main__":
