@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 main.py
-Foreclosure Sales Scraper (One-Time Full Load + Incremental Updates Thereafter)
-Enhancements:
-- Rolling 30-day filter for visible sheets (today .. today+29 days).
-- Maintain an "All Data (Archive)" sheet with full, unfiltered history.
-- Snapshot-aware "new row" highlighting (compare latest snapshot vs previous).
+Enhanced Foreclosure Sales Scraper with 30-Day Rolling Filter and New Record Highlighting
+Environment variables required:
+- SPREADSHEET_ID (Google Sheets ID)
+- Either:
+  - GOOGLE_CREDENTIALS_FILE (GitLab "File" variable path), OR
+  - GOOGLE_CREDENTIALS (raw JSON string), OR
+  - GOOGLE_CREDENTIALS (a path to a local JSON file)
 """
 
 import os
@@ -48,18 +50,17 @@ TARGET_COUNTIES = [
 POLITE_DELAY_SECONDS = 1.5
 MAX_RETRIES = 5
 
-# Rolling window params
-WINDOW_DAYS = 30  # today .. today+29
-DATE_COL_NAME = "Sales Date"
-DATE_INPUT_FORMATS = [
-    "%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d",
-    "%m/%d/%y", "%m-%d-%y", "%Y/%m/%d",
-]
-
 # -----------------------------
 # Credential helpers
 # -----------------------------
 def load_service_account_info():
+    """
+    Loads service account JSON from:
+    1) GOOGLE_CREDENTIALS_FILE (File variable path) OR
+    2) GOOGLE_CREDENTIALS raw JSON string OR
+    3) GOOGLE_CREDENTIALS path to local file
+    Returns parsed dict or raises ValueError.
+    """
     file_env = os.environ.get("GOOGLE_CREDENTIALS_FILE")
     if file_env:
         if os.path.exists(file_env):
@@ -76,12 +77,14 @@ def load_service_account_info():
         raise ValueError("Environment variable GOOGLE_CREDENTIALS (or GOOGLE_CREDENTIALS_FILE) not set.")
 
     creds_raw_stripped = creds_raw.strip()
+    # Case: raw JSON string
     if creds_raw_stripped.startswith("{"):
         try:
             return json.loads(creds_raw)
         except json.JSONDecodeError as e:
             raise ValueError(f"GOOGLE_CREDENTIALS contains invalid JSON: {e}")
 
+    # Case: path to file
     if os.path.exists(creds_raw):
         try:
             with open(creds_raw, "r", encoding="utf-8") as fh:
@@ -101,7 +104,59 @@ def init_sheets_service_from_env():
         raise RuntimeError(f"Failed to create Google Sheets client: {e}")
 
 # -----------------------------
-# Sheets client wrapper
+# Date utilities
+# -----------------------------
+def parse_sale_date(date_str):
+    """Parse various date formats and return datetime object."""
+    if not date_str:
+        return None
+    
+    # Clean the date string
+    date_str = date_str.strip()
+    
+    # Common formats found in the data
+    formats = [
+        "%m/%d/%Y %I:%M %p",  # 09/08/2025 2:00 PM
+        "%m/%d/%Y",           # 09/08/2025
+        "%Y-%m-%d %H:%M:%S",  # 2025-09-08 14:00:00
+        "%Y-%m-%d",           # 2025-09-08
+        "%m-%d-%Y",           # 09-08-2025
+        "%d/%m/%Y",           # 08/09/2025 (day/month/year)
+    ]
+    
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    
+    # Try to extract just the date part if there's extra text
+    date_match = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{4})', date_str)
+    if date_match:
+        date_part = date_match.group(1)
+        for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y"]:
+            try:
+                return datetime.strptime(date_part, fmt)
+            except ValueError:
+                continue
+    
+    return None
+
+def is_within_30_days(sale_date_str, reference_date=None):
+    """Check if sale date is within next 30 days from reference date."""
+    if reference_date is None:
+        reference_date = datetime.now()
+    
+    sale_date = parse_sale_date(sale_date_str)
+    if not sale_date:
+        return False
+    
+    # Check if sale date is within the next 30 days
+    end_date = reference_date + timedelta(days=29)  # 30 days including today
+    return reference_date.date() <= sale_date.date() <= end_date.date()
+
+# -----------------------------
+# Enhanced Sheets client wrapper
 # -----------------------------
 class SheetsClient:
     def __init__(self, spreadsheet_id: str, service):
@@ -123,13 +178,6 @@ class SheetsClient:
                 return True
         return False
 
-    def _get_sheet_id(self, sheet_name: str):
-        info = self.spreadsheet_info()
-        for s in info.get('sheets', []):
-            if s['properties']['title'] == sheet_name:
-                return s['properties']['sheetId']
-        return None
-
     def create_sheet_if_missing(self, sheet_name: str):
         if self.sheet_exists(sheet_name):
             return
@@ -144,7 +192,7 @@ class SheetsClient:
         try:
             res = self.svc.values().get(spreadsheetId=self.spreadsheet_id, range=f"'{sheet_name}'!{rng}").execute()
             return res.get("values", [])
-        except HttpError:
+        except HttpError as e:
             return []
 
     def clear(self, sheet_name: str, rng: str = "A:Z"):
@@ -161,140 +209,215 @@ class SheetsClient:
                 valueInputOption="USER_ENTERED",
                 body={"values": values}
             ).execute()
-
-            # --- Beautify: bold header, freeze row, auto resize ---
-            sheet_id = self._get_sheet_id(sheet_name)
-            if sheet_id is None:
-                return
-
-            header_row_index = 1  # the second row is the column header (0-based: 1)
-            col_count = len(values[1]) if len(values) > 1 else 10
-
-            self.svc.batchUpdate(
-                spreadsheetId=self.spreadsheet_id,
-                body={
-                    "requests": [
-                        {"repeatCell": {
-                            "range": {
-                                "sheetId": sheet_id,
-                                "startRowIndex": header_row_index,
-                                "endRowIndex": header_row_index + 1
-                            },
-                            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
-                            "fields": "userEnteredFormat.textFormat.bold"
-                        }},
-                        {"updateSheetProperties": {
-                            "properties": {"sheetId": sheet_id,
-                                           "gridProperties": {"frozenRowCount": 2}},
-                            "fields": "gridProperties.frozenRowCount"
-                        }},
-                        {"autoResizeDimensions": {
-                            "dimensions": {
-                                "sheetId": sheet_id,
-                                "dimension": "COLUMNS",
-                                "startIndex": 0,
-                                "endIndex": col_count
-                            }
-                        }}
-                    ]
-                }
-            ).execute()
         except HttpError as e:
             print(f"✗ write_values error on '{sheet_name}': {e}")
             raise
 
-    # --- snapshot style: prepend only new rows ---
-    def prepend_snapshot(self, sheet_name: str, header_row, new_rows):
-        snapshot_header = [[f"Snapshot for {datetime.now().strftime('%A - %Y-%m-%d')}"]]
-        payload = snapshot_header + [header_row] + new_rows + [[""]]
-        existing = self.get_values(sheet_name, "A:ZZ")
-        values = payload + existing
-        self.clear(sheet_name, "A:ZZ")
-        self.write_values(sheet_name, values, "A1")
-        print(f"✓ Prepended snapshot to '{sheet_name}': {len(new_rows)} new rows")
+    def _get_sheet_id(self, sheet_name: str):
+        info = self.spreadsheet_info()
+        for s in info.get('sheets', []):
+            if s['properties']['title'] == sheet_name:
+                return s['properties']['sheetId']
+        return None
 
-    def overwrite_with_snapshot(self, sheet_name: str, header_row, all_rows):
-        snapshot_header = [[f"Snapshot for {datetime.now().strftime('%A - %Y-%m-%d')}"]]
-        values = snapshot_header + [header_row] + all_rows + [[""]]
-        self.clear(sheet_name, "A:ZZ")
-        self.write_values(sheet_name, values, "A1")
-        print(f"✓ Wrote full snapshot to '{sheet_name}' ({len(all_rows)} rows)")
-
-    # ---------- formatting helpers for highlighting ----------
-    def clear_highlight_formatting(self, sheet_name: str, row_ranges=None):
-        """
-        Clear direct background fills. If row_ranges is provided, only clear in those ranges.
-        Otherwise clears a default wide area.
-        """
+    def apply_formatting_and_highlighting(self, sheet_name: str, header_row, all_rows, new_property_ids):
+        """Apply formatting, freeze header, and highlight new records."""
         try:
             sheet_id = self._get_sheet_id(sheet_name)
             if sheet_id is None:
+                print(f"⚠ Could not find sheet ID for '{sheet_name}'")
                 return
-            requests = []
-            if row_ranges:
-                for (r0, r1, c0, c1) in row_ranges:
-                    requests.append({
-                        "repeatCell": {
-                            "range": {
-                                "sheetId": sheet_id,
-                                "startRowIndex": r0,
-                                "endRowIndex": r1,
-                                "startColumnIndex": c0,
-                                "endColumnIndex": c1
-                            },
-                            "cell": {"userEnteredFormat": {"backgroundColor": None}},
-                            "fields": "userEnteredFormat.backgroundColor"
-                        }
-                    })
-            else:
-                # Fallback: clear first 2000 rows x 30 columns
-                requests.append({
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 0,
-                            "endRowIndex": 2000,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": 30
-                        },
-                        "cell": {"userEnteredFormat": {"backgroundColor": None}},
-                        "fields": "userEnteredFormat.backgroundColor"
-                    }
-                })
-            if requests:
-                self.svc.batchUpdate(spreadsheetId=self.spreadsheet_id, body={"requests": requests}).execute()
-        except HttpError as e:
-            print(f"⚠ clear_highlight_formatting failed on '{sheet_name}': {e}")
 
-    def apply_highlight_for_rows(self, sheet_name: str, row_ranges):
-        """
-        Apply direct background fills to the specified row ranges.
-        row_ranges: list of (start_row, end_row, start_col, end_col) 0-based, end exclusive.
-        """
-        if not row_ranges:
-            return
-        sheet_id = self._get_sheet_id(sheet_name)
-        if sheet_id is None:
-            return
-        requests = []
-        for (r0, r1, c0, c1) in row_ranges:
+            requests = []
+            
+            # 1. Bold and freeze header row (row 2, since row 1 is snapshot title)
             requests.append({
                 "repeatCell": {
                     "range": {
                         "sheetId": sheet_id,
-                        "startRowIndex": r0,
-                        "endRowIndex": r1,
-                        "startColumnIndex": c0,
-                        "endColumnIndex": c1
+                        "startRowIndex": 1,
+                        "endRowIndex": 2
                     },
-                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.85, "green": 0.94, "blue": 0.85}}},
-                    "fields": "userEnteredFormat.backgroundColor"
+                    "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                    "fields": "userEnteredFormat.textFormat.bold"
                 }
             })
-        try:
-            self.svc.batchUpdate(spreadsheetId=self.spreadsheet_id, body={"requests": requests}).execute()
+            
+            requests.append({
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet_id,
+                        "gridProperties": {"frozenRowCount": 2}
+                    },
+                    "fields": "gridProperties.frozenRowCount"
+                }
+            })
+
+            # 2. Auto-resize columns
+            num_cols = len(header_row) if header_row else 10
+            requests.append({
+                "autoResizeDimensions": {
+                    "dimensions": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 0,
+                        "endIndex": num_cols
+                    }
+                }
+            })
+
+            # 3. Highlight new records (light green background)
+            if new_property_ids and all_rows:
+                for row_idx, row in enumerate(all_rows):
+                    if row and len(row) > 0:
+                        property_id = row[0]  # Property ID is first column
+                        if property_id in new_property_ids:
+                            # Row index in sheet (add 2 because: 0-indexed + snapshot title + header)
+                            sheet_row_idx = row_idx + 2
+                            requests.append({
+                                "repeatCell": {
+                                    "range": {
+                                        "sheetId": sheet_id,
+                                        "startRowIndex": sheet_row_idx,
+                                        "endRowIndex": sheet_row_idx + 1,
+                                        "startColumnIndex": 0,
+                                        "endColumnIndex": num_cols
+                                    },
+                                    "cell": {
+                                        "userEnteredFormat": {
+                                            "backgroundColor": {
+                                                "red": 0.85,
+                                                "green": 0.95,
+                                                "blue": 0.85
+                                            }
+                                        }
+                                    },
+                                    "fields": "userEnteredFormat.backgroundColor"
+                                }
+                            })
+
+            if requests:
+                self.svc.batchUpdate(
+                    spreadsheetId=self.spreadsheet_id,
+                    body={"requests": requests}
+                ).execute()
+                
+                if new_property_ids:
+                    print(f"✓ Highlighted {len(new_property_ids)} new records in '{sheet_name}'")
+
         except HttpError as e:
-            print(f"⚠ Failed to apply highlighting on '{sheet_name}': {e}")
+            print(f"✗ Formatting error on '{sheet_name}': {e}")
+
+    def get_previous_snapshot_property_ids(self, sheet_name: str):
+        """Extract Property IDs from the previous snapshot (before the latest one)."""
+        existing = self.get_values(sheet_name, "A:Z")
+        if not existing:
+            return set()
+        
+        property_ids = set()
+        current_snapshot_found = False
+        in_previous_snapshot = False
+        
+        for row in existing:
+            if not row:
+                continue
+                
+            # Check if this is a snapshot header
+            if len(row) > 0 and row[0].startswith("Snapshot for"):
+                if not current_snapshot_found:
+                    # This is the current (latest) snapshot
+                    current_snapshot_found = True
+                    in_previous_snapshot = False
+                else:
+                    # This is the previous snapshot
+                    in_previous_snapshot = True
+                continue
+            
+            # Check if this is a data header row
+            if row and len(row) > 0 and row[0].lower().replace(" ", "") in {"propertyid", "property id"}:
+                continue
+            
+            # Check for empty separator rows
+            if len(row) == 1 and row[0].strip() == "":
+                if in_previous_snapshot:
+                    break  # End of previous snapshot
+                continue
+            
+            # Collect property IDs from previous snapshot
+            if in_previous_snapshot and row and len(row) > 0:
+                property_id = row[0].strip()
+                if property_id:
+                    property_ids.add(property_id)
+        
+        return property_ids
+
+    def write_full_snapshot_with_filter(self, sheet_name: str, header_row, all_rows, county_name=""):
+        """Write full snapshot but show only records within next 30 days for county sheets."""
+        current_date = datetime.now()
+        snapshot_header = [[f"Snapshot for {current_date.strftime('%A - %Y-%m-%d')}"]]
+        
+        # Get previous snapshot property IDs for highlighting
+        previous_property_ids = self.get_previous_snapshot_property_ids(sheet_name)
+        
+        if sheet_name == "All Data":
+            # All Data sheet: show everything, no filtering
+            filtered_rows = all_rows
+            new_property_ids = set()
+            for row in all_rows:
+                if row and len(row) > 0:
+                    property_id = row[0]
+                    if property_id not in previous_property_ids:
+                        new_property_ids.add(property_id)
+        else:
+            # County sheets: apply 30-day filter
+            filtered_rows = []
+            new_property_ids = set()
+            
+            # Find Sales Date column index
+            sales_date_idx = None
+            if "Sales Date" in header_row:
+                sales_date_idx = header_row.index("Sales Date")
+            elif "Sale Date" in header_row:
+                sales_date_idx = header_row.index("Sale Date")
+            
+            for row in all_rows:
+                if not row or len(row) == 0:
+                    continue
+                    
+                # Check if within 30 days
+                include_row = True
+                if sales_date_idx is not None and len(row) > sales_date_idx:
+                    sale_date = row[sales_date_idx]
+                    include_row = is_within_30_days(sale_date, current_date)
+                
+                if include_row:
+                    filtered_rows.append(row)
+                    # Check if this is a new record
+                    property_id = row[0]
+                    if property_id not in previous_property_ids:
+                        new_property_ids.add(property_id)
+
+        # Prepare final data structure
+        values = snapshot_header + [header_row] + filtered_rows + [[""]]
+        
+        # Clear and write
+        self.clear(sheet_name, "A:Z")
+        self.write_values(sheet_name, values, "A1")
+        
+        # Apply formatting and highlighting
+        self.apply_formatting_and_highlighting(sheet_name, header_row, filtered_rows, new_property_ids)
+        
+        # Print summary
+        filter_msg = ""
+        if sheet_name != "All Data":
+            total_records = len(all_rows)
+            shown_records = len(filtered_rows)
+            filter_msg = f" (showing {shown_records}/{total_records} within 30 days)"
+        
+        new_count = len(new_property_ids)
+        new_msg = f", {new_count} new" if new_count > 0 else ""
+        
+        print(f"✓ Updated '{sheet_name}': {len(filtered_rows)} records{filter_msg}{new_msg}")
 
 # -----------------------------
 # Scrape helpers
@@ -310,33 +433,6 @@ def extract_property_id_from_href(href: str) -> str:
         return q.get("PropertyId", [""])[0]
     except Exception:
         return ""
-
-def parse_date_safe(s: str):
-    s = (s or "").strip()
-    if not s:
-        return None
-    # Try common formats
-    for fmt in DATE_INPUT_FORMATS:
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            continue
-    # Try lenient cleanup: replace double spaces, commas
-    s2 = s.replace(",", " ").replace("  ", " ").strip()
-    for fmt in DATE_INPUT_FORMATS:
-        try:
-            return datetime.strptime(s2, fmt).date()
-        except ValueError:
-            continue
-    return None
-
-def in_next_30_days(sales_date_str: str, today=None) -> bool:
-    if today is None:
-        today = datetime.now().date()
-    d = parse_date_safe(sales_date_str)
-    if d is None:
-        return False
-    return today <= d <= (today + timedelta(days=WINDOW_DAYS - 1))
 
 # -----------------------------
 # Scraper
@@ -376,6 +472,7 @@ class ForeclosureScraper:
                 pass
 
     async def get_details_data(self, page, details_url, list_url, county, current_data):
+        """Extract additional data from details page."""
         extracted = {
             "approx_judgment": "",
             "sale_type": "",
@@ -383,20 +480,22 @@ class ForeclosureScraper:
             "defendant": current_data.get("defendant", ""),
             "sales_date": current_data.get("sales_date", "")
         }
+        
         if not details_url:
             return extracted
+            
         try:
             await self.goto_with_retry(page, details_url)
             await self.dismiss_banners(page)
             await page.wait_for_selector(".sale-details-list", timeout=15000)
-
+            
             items = page.locator(".sale-details-list .sale-detail-item")
             for j in range(await items.count()):
                 try:
                     label = (await items.nth(j).locator(".sale-detail-label").inner_text()).strip()
                     val = (await items.nth(j).locator(".sale-detail-value").inner_text()).strip()
                     label_low = label.lower()
-
+                    
                     if "address" in label_low:
                         try:
                             val_html = await items.nth(j).locator(".sale-detail-value").inner_html()
@@ -407,40 +506,44 @@ class ForeclosureScraper:
                         except Exception:
                             if not extracted["address"]:
                                 extracted["address"] = val
-
+                                
                     elif ("Approx. Judgment" in label or "Approx. Upset" in label
-                          or "Approximate Judgment:" in label or "Approx Judgment*" in label
-                          or "Approx. Upset*" in label or "Debt Amount" in label):
+                        or "Approximate Judgment:" in label or "Approx Judgment*" in label 
+                        or "Approx. Upset*" in label or "Debt Amount" in label):
                         extracted["approx_judgment"] = val
-
+                        
                     elif "defendant" in label_low and not extracted["defendant"]:
                         extracted["defendant"] = val
-
+                        
                     elif "sale" in label_low and "date" in label_low and not extracted["sales_date"]:
                         extracted["sales_date"] = val
-
+                        
                     elif county["county_id"] == "24" and "sale type" in label_low:
                         extracted["sale_type"] = val
-
+                        
                 except Exception:
                     continue
-
+                    
         except Exception as e:
             print(f"⚠ Details page error for {county['county_name']}: {e}")
         finally:
+            # Return to list page
             try:
                 await self.goto_with_retry(page, list_url)
                 await self.dismiss_banners(page)
                 await page.wait_for_selector("table.table.table-striped tbody tr, .no-sales, #noData", timeout=30000)
             except Exception:
                 pass
+                
         return extracted
 
     async def safe_get_cell_text(self, row, colmap, colname):
+        """Safely extract text from table cell by column name."""
         try:
             idx = colmap.get(colname)
             if idx is None:
                 return ""
+            # Get all cells first to avoid issues with nth() selector
             cells = await row.locator("td").all()
             if idx < len(cells):
                 txt = await cells[idx].inner_text()
@@ -450,6 +553,7 @@ class ForeclosureScraper:
             return ""
 
     async def scrape_county_sales(self, page, county):
+        """Main scraping function that handles different table structures dynamically."""
         url = f"{BASE_URL}Sales/SalesSearch?countyId={county['county_id']}"
         print(f"[INFO] Scraping {county['county_name']} -> {url}")
 
@@ -464,6 +568,7 @@ class ForeclosureScraper:
                     print(f"[WARN] No sales found for {county['county_name']}")
                     return []
 
+                # Build column mapping from headers
                 colmap = await self.get_table_columns(page)
                 if not colmap:
                     print(f"[WARN] Could not determine table structure for {county['county_name']}")
@@ -480,13 +585,21 @@ class ForeclosureScraper:
                     details_url = details_href if details_href.startswith("http") else urljoin(BASE_URL, details_href)
                     property_id = extract_property_id_from_href(details_href)
 
+                    # Get values by column name
                     sales_date = await self.safe_get_cell_text(row, colmap, "sales_date")
                     defendant = await self.safe_get_cell_text(row, colmap, "defendant")
                     prop_address = await self.safe_get_cell_text(row, colmap, "address")
 
-                    current_data = {"address": prop_address, "defendant": defendant, "sales_date": sales_date}
+                    # Get additional data from details page
+                    current_data = {
+                        "address": prop_address,
+                        "defendant": defendant,
+                        "sales_date": sales_date
+                    }
+                    
                     details_data = await self.get_details_data(page, details_url, url, county, current_data)
 
+                    # Build result row
                     row_data = {
                         "Property ID": property_id,
                         "Address": details_data["address"],
@@ -495,6 +608,8 @@ class ForeclosureScraper:
                         "Approx Judgment": details_data["approx_judgment"],
                         "County": county['county_name'],
                     }
+                    
+                    # Add Sale Type column only for New Castle County
                     if county["county_id"] == "24":
                         row_data["Sale Type"] = details_data["sale_type"]
 
@@ -510,11 +625,12 @@ class ForeclosureScraper:
         return []
 
     async def get_table_columns(self, page):
+        """Get column mapping based on headers to handle different table structures."""
         try:
             header_ths = page.locator("table.table.table-striped thead tr th")
             if await header_ths.count() == 0:
                 header_ths = page.locator("table.table.table-striped tr").first.locator("th")
-
+            
             colmap = {}
             for i in range(await header_ths.count()):
                 try:
@@ -527,151 +643,19 @@ class ForeclosureScraper:
                         colmap["address"] = i
                 except Exception:
                     continue
+            
             return colmap
         except Exception as e:
             print(f"[ERROR] Failed to get column mapping: {e}")
             return {}
 
 # -----------------------------
-# Snapshot parsing and highlighting helpers
-# -----------------------------
-def find_snapshot_blocks(values):
-    """
-    Identify snapshot blocks:
-    Returns list of dicts with:
-      {
-        "snapshot_header_row": int,   # 0-based index of the "Snapshot for ..." row
-        "header_row": int,            # 0-based index of the column header row
-        "data_start_row": int,        # first data row
-        "data_end_row": int,          # first row AFTER data block (blank line or next snapshot or end)
-        "headers": [col1, col2, ...]
-      }
-    values: list of rows from get_values()
-    """
-    blocks = []
-    i = 0
-    n = len(values)
-    while i < n:
-        row = values[i] if i < n else []
-        row0 = (row[0].strip() if row and len(row) > 0 else "")
-        if row0.startswith("Snapshot for "):
-            snapshot_header_row = i
-            header_row = i + 1 if (i + 1) < n else None
-            headers = values[header_row] if header_row is not None and header_row < n else []
-            # find data until blank line or next snapshot
-            data_start_row = (header_row + 1) if header_row is not None else (i + 1)
-            j = data_start_row
-            while j < n:
-                r = values[j]
-                r0 = (r[0].strip() if r and len(r) > 0 else "")
-                if r0.startswith("Snapshot for "):
-                    break
-                if (not r) or (len(r) == 1 and r[0].strip() == ""):
-                    # blank line ends the block
-                    j += 1
-                    break
-                j += 1
-            data_end_row = j
-            blocks.append({
-                "snapshot_header_row": snapshot_header_row,
-                "header_row": header_row,
-                "data_start_row": data_start_row,
-                "data_end_row": data_end_row,
-                "headers": headers
-            })
-            i = data_end_row
-        else:
-            i += 1
-    return blocks
-
-def headers_index_map(headers):
-    return {h.strip(): idx for idx, h in enumerate(headers or [])}
-
-def collect_keys_from_block(values, block, key_fn):
-    """
-    key_fn(row_values) -> key or None
-    """
-    keys = set()
-    for r in range(block["data_start_row"], block["data_end_row"]):
-        row = values[r] if r < len(values) else []
-        if not row or (len(row) == 1 and row[0].strip() == ""):
-            continue
-        k = key_fn(row, block["headers"])
-        if k:
-            keys.add(k)
-    return keys
-
-def collect_row_ranges_for_new_rows(values, block, key_fn, old_keys):
-    """
-    Return list of (start_row, end_row, start_col, end_col) for highlight.
-    """
-    # full width: from col 0 to last non-empty in headers or data
-    end_col = max(len(block["headers"]), max((len(values[r]) for r in range(block["data_start_row"], block["data_end_row"])), default=0))
-    ranges = []
-    for r in range(block["data_start_row"], block["data_end_row"]):
-        row = values[r] if r < len(values) else []
-        if not row or (len(row) == 1 and row[0].strip() == ""):
-            continue
-        k = key_fn(row, block["headers"])
-        if k and (k not in old_keys):
-            ranges.append((r, r+1, 0, end_col))
-    return ranges
-
-def key_fn_county(row, headers):
-    # key = Property ID
-    hmap = headers_index_map(headers)
-    idx = hmap.get("Property ID")
-    if idx is None:
-        return None
-    pid = (row[idx] if len(row) > idx else "").strip()
-    return pid or None
-
-def key_fn_all_data(row, headers):
-    # key = (County, Property ID)
-    hmap = headers_index_map(headers)
-    idx_pid = hmap.get("Property ID")
-    idx_cty = hmap.get("County")
-    if idx_pid is None or idx_cty is None:
-        return None
-    pid = (row[idx_pid] if len(row) > idx_pid else "").strip()
-    cty = (row[idx_cty] if len(row) > idx_cty else "").strip()
-    if pid and cty:
-        return (cty, pid)
-    return None
-
-def apply_snapshot_highlighting(sheets: SheetsClient, sheet_name: str, all_values, key_mode: str):
-    """
-    key_mode: "county" or "all"
-    Compares latest snapshot against immediately previous snapshot and highlights new rows in the latest.
-    Applies direct background fills (no conditional formatting rules).
-    """
-    blocks = find_snapshot_blocks(all_values)
-    if not blocks:
-        return
-    latest = blocks[0]
-    prev = blocks[1] if len(blocks) > 1 else None
-
-    key_fn = key_fn_county if key_mode == "county" else key_fn_all_data
-    old_keys = set()
-    if prev:
-        old_keys = collect_keys_from_block(all_values, prev, key_fn)
-    # Determine new rows in the latest block
-    ranges = collect_row_ranges_for_new_rows(all_values, latest, key_fn, old_keys)
-
-    # Clear fills in the latest data block first, then apply only for new rows
-    full_width = max(len(latest["headers"]),
-                     max((len(all_values[r]) for r in range(latest["data_start_row"], latest["data_end_row"])), default=0))
-    if full_width == 0:
-        full_width = 30  # safe default
-    sheets.clear_highlight_formatting(sheet_name, row_ranges=[(latest["data_start_row"], latest["data_end_row"], 0, full_width)])
-    sheets.apply_highlight_for_rows(sheet_name, ranges)
-
-# -----------------------------
 # Orchestration
 # -----------------------------
 async def run():
     start_ts = datetime.now()
-    print(f"▶ Starting scrape at {start_ts}")
+    print(f"▶ Starting enhanced scrape at {start_ts}")
+    print(f"📅 30-day window: {start_ts.strftime('%Y-%m-%d')} to {(start_ts + timedelta(days=29)).strftime('%Y-%m-%d')}")
 
     spreadsheet_id = os.environ.get("SPREADSHEET_ID")
     if not spreadsheet_id:
@@ -687,10 +671,6 @@ async def run():
 
     sheets = SheetsClient(spreadsheet_id, service)
     ALL_DATA_SHEET = "All Data"
-    ALL_DATA_ARCHIVE_SHEET = "All Data (Archive)"
-
-    first_run = not sheets.sheet_exists(ALL_DATA_SHEET)
-    print(f"ℹ First run? {'YES' if first_run else 'NO'}")
 
     all_data_rows = []
 
@@ -710,191 +690,71 @@ async def run():
 
                 df_county = pd.DataFrame(county_records)
 
-                # Maintain complete rows for archive (no filter)
-                all_data_rows.extend(df_county.astype(str).values.tolist())
-
-                # Apply rolling 30-day filter for visible county tabs
-                if DATE_COL_NAME in df_county.columns:
-                    df_county_visible = df_county[df_county[DATE_COL_NAME].apply(in_next_30_days)]
-                else:
-                    df_county_visible = df_county.iloc[0:0]  # no date column -> show nothing
-                # dynamic header (skip County col)
+                # Dynamic header (skip County col for individual county sheets)
                 county_columns = [col for col in df_county.columns if col != "County"]
                 county_header = county_columns
 
-                if first_run or not sheets.sheet_exists(county_tab):
-                    sheets.create_sheet_if_missing(county_tab)
-                    rows = df_county_visible.drop(columns=["County"]).astype(str).values.tolist()
-                    sheets.overwrite_with_snapshot(county_tab, county_header, rows)
-                else:
-                    # Build set of existing Property IDs from the latest visible data for incremental prepend
-                    # We still only prepend rows considered "new" vs sheet’s existing data.
-                    existing = sheets.get_values(county_tab, "A:ZZ")
-                    existing_ids = set()
-                    if existing:
-                        # find first snapshot header’s header row
-                        blocks = find_snapshot_blocks(existing)
-                        # We'll gather IDs from entire sheet (all blocks)
-                        pid_idx = None
-                        for blk in blocks:
-                            hmap = headers_index_map(blk["headers"])
-                            if pid_idx is None and "Property ID" in hmap:
-                                pid_idx = hmap["Property ID"]
-                            for r in range(blk["data_start_row"], blk["data_end_row"]):
-                                row = existing[r] if r < len(existing) else []
-                                if not row or (len(row) == 1 and row[0].strip() == ""):
-                                    continue
-                                if pid_idx is not None and len(row) > pid_idx:
-                                    pid = (row[pid_idx] or "").strip()
-                                    if pid:
-                                        existing_ids.add(pid)
+                # Create county sheet and write full snapshot with 30-day filter
+                sheets.create_sheet_if_missing(county_tab)
+                rows = df_county.drop(columns=["County"]).astype(str).values.tolist()
+                sheets.write_full_snapshot_with_filter(county_tab, county_header, rows, county['county_name'])
 
-                    # rows to prepend = filtered visible data not in existing IDs
-                    new_df = df_county_visible[~df_county_visible["Property ID"].astype(str).isin(existing_ids)].copy()
-                    if new_df.empty:
-                        print(f"✓ No new rows for {county['county_name']}")
-                    else:
-                        new_rows = new_df.drop(columns=["County"]).astype(str).values.tolist()
-                        sheets.prepend_snapshot(county_tab, county_header, new_rows)
-
-                print(f"✓ Completed {county['county_name']}: {len(df_county)} records total, {len(df_county_visible)} in 30-day window")
+                # Add to all data collection
+                all_data_rows.extend(df_county.astype(str).values.tolist())
                 await asyncio.sleep(POLITE_DELAY_SECONDS)
+                
             except Exception as e:
                 print(f"❌ Failed county '{county['county_name']}': {e}")
                 continue
 
         await browser.close()
 
-    # --- Build All Data (Archive) (unfiltered) and All Data (filtered 30d) ---
+    # --- All Data sheet (no 30-day filter, shows everything) ---
     try:
         if not all_data_rows:
-            print("⚠ No data scraped across all counties. Skipping 'All Data' and 'All Data (Archive)'.")
-            return
-
-        # Determine header with Sale Type if any New Castle rows exist
-        has_sale_type = any((len(r) >= 7) for r in all_data_rows)
-        header_all = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment", "County"] + (["Sale Type"] if has_sale_type else [])
-
-        # Normalize rows to header length
-        target_len = len(header_all)
-        norm_rows = []
-        for row in all_data_rows:
-            r = list(row)
-            # If 6 cols and we have Sale Type, append ""
-            if has_sale_type and len(r) == 6:
-                r.append("")
-            # If more, trim
-            r = (r + [""] * target_len)[:target_len]
-            norm_rows.append([str(x) for x in r])
-
-        # ARCHIVE: keep everything, snapshot-prepend always
-        sheets.create_sheet_if_missing(ALL_DATA_ARCHIVE_SHEET)
-        if not sheets.sheet_exists(ALL_DATA_ARCHIVE_SHEET):
-            print(f"✗ Could not create {ALL_DATA_ARCHIVE_SHEET}")
+            print("⚠ No data scraped across all counties. Skipping 'All Data'.")
         else:
-            # On first run, write everything as full snapshot, else prepend only the rows not seen before (by County+PID)
-            if first_run:
-                sheets.overwrite_with_snapshot(ALL_DATA_ARCHIVE_SHEET, header_all, norm_rows)
+            # Standard columns
+            standard_cols = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment", "County"]
+
+            # Check if we have New Castle County data (adds Sale Type column)
+            has_new_castle = any(county["county_id"] == "24" for county in TARGET_COUNTIES)
+            if has_new_castle:
+                header_all = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment", "County", "Sale Type"]
+                padded_rows = []
+                for row in all_data_rows:
+                    if len(row) == 6:  # no Sale Type
+                        padded_row = row[:5] + [row[5]] + [""]  # Add empty Sale Type
+                        padded_rows.append(padded_row)
+                    elif len(row) == 7:
+                        padded_rows.append(row)
+                    else:
+                        # Handle any other row lengths
+                        while len(row) < 7:
+                            row.append("")
+                        padded_rows.append(row[:7])
+                all_data_rows = padded_rows
             else:
-                existing = sheets.get_values(ALL_DATA_ARCHIVE_SHEET, "A:ZZ")
-                existing_pairs = set()
-                if existing:
-                    blocks = find_snapshot_blocks(existing)
-                    # collect keys from all blocks
-                    h_idx = None
-                    c_idx = None
-                    for blk in blocks:
-                        hmap = headers_index_map(blk["headers"])
-                        if h_idx is None:
-                            h_idx = hmap.get("Property ID")
-                        if c_idx is None:
-                            c_idx = hmap.get("County")
-                        for r in range(blk["data_start_row"], blk["data_end_row"]):
-                            row = existing[r] if r < len(existing) else []
-                            pid = (row[h_idx] if h_idx is not None and len(row) > h_idx else "").strip()
-                            cty = (row[c_idx] if c_idx is not None and len(row) > c_idx else "").strip()
-                            if pid and cty:
-                                existing_pairs.add((cty, pid))
-                new_rows_archive = []
-                # indices per header_all
-                idx_pid = header_all.index("Property ID")
-                idx_cty = header_all.index("County")
-                for r in norm_rows:
-                    pid = (r[idx_pid] if len(r) > idx_pid else "").strip()
-                    cty = (r[idx_cty] if len(r) > idx_cty else "").strip()
-                    if pid and cty and (cty, pid) not in existing_pairs:
-                        new_rows_archive.append(r)
-                if new_rows_archive:
-                    sheets.prepend_snapshot(ALL_DATA_ARCHIVE_SHEET, header_all, new_rows_archive)
-                    print(f"✓ {ALL_DATA_ARCHIVE_SHEET} updated: {len(new_rows_archive)} new rows")
-                else:
-                    print(f"✓ No new rows for {ALL_DATA_ARCHIVE_SHEET}")
+                header_all = standard_cols
 
-        # VISIBLE All Data: apply 30-day filter
-        df_all = pd.DataFrame(norm_rows, columns=header_all)
-        if DATE_COL_NAME in df_all.columns:
-            df_visible = df_all[df_all[DATE_COL_NAME].apply(in_next_30_days)].copy()
-        else:
-            df_visible = df_all.iloc[0:0].copy()
-
-        # Write or prepend filtered rows to All Data
-        sheets.create_sheet_if_missing(ALL_DATA_SHEET)
-        if first_run:
-            sheets.overwrite_with_snapshot(ALL_DATA_SHEET, header_all, df_visible.values.tolist())
-        else:
-            existing = sheets.get_values(ALL_DATA_SHEET, "A:ZZ")
-            existing_pairs = set()
-            if existing:
-                blocks = find_snapshot_blocks(existing)
-                # collect keys from all blocks
-                pid_idx = None
-                cty_idx = None
-                for blk in blocks:
-                    hmap = headers_index_map(blk["headers"])
-                    if pid_idx is None:
-                        pid_idx = hmap.get("Property ID")
-                    if cty_idx is None:
-                        cty_idx = hmap.get("County")
-                    for r in range(blk["data_start_row"], blk["data_end_row"]):
-                        row = existing[r] if r < len(existing) else []
-                        pid = (row[pid_idx] if pid_idx is not None and len(row) > pid_idx else "").strip()
-                        cty = (row[cty_idx] if cty_idx is not None and len(row) > cty_idx else "").strip()
-                        if pid and cty:
-                            existing_pairs.add((cty, pid))
-
-            # Only prepend rows that are not already present in sheet history
-            idx_pid = header_all.index("Property ID")
-            idx_cty = header_all.index("County")
-            to_prepend = []
-            for r in df_visible.values.tolist():
-                pid = (r[idx_pid] if len(r) > idx_pid else "").strip()
-                cty = (r[idx_cty] if len(r) > idx_cty else "").strip()
-                if pid and cty and (cty, pid) not in existing_pairs:
-                    to_prepend.append(r)
-
-            if to_prepend:
-                sheets.prepend_snapshot(ALL_DATA_SHEET, header_all, to_prepend)
-                print(f"✓ All Data updated: {len(to_prepend)} new rows")
-            else:
-                print("✓ No new rows for 'All Data'")
-
-        # After writes, re-fetch values and apply highlighting for “new” rows vs previous snapshot
-        # County tabs
-        for county in TARGET_COUNTIES:
-            county_tab = county["county_name"][:30]
-            if sheets.sheet_exists(county_tab):
-                vals = sheets.get_values(county_tab, "A:ZZ")
-                apply_snapshot_highlighting(sheets, county_tab, vals, key_mode="county")
-
-        # All Data (filtered)
-        if sheets.sheet_exists(ALL_DATA_SHEET):
-            vals = sheets.get_values(ALL_DATA_SHEET, "A:ZZ")
-            apply_snapshot_highlighting(sheets, ALL_DATA_SHEET, vals, key_mode="all")
-
-        # Archive sheet highlighting optional (usually not necessary); skip to reduce cost.
+            # Create and update All Data sheet (no filtering - shows all records)
+            sheets.create_sheet_if_missing(ALL_DATA_SHEET)
+            sheets.write_full_snapshot_with_filter(ALL_DATA_SHEET, header_all, all_data_rows)
 
     except Exception as e:
-        print(f"✗ Error updating sheets: {e}")
+        print(f"✗ Error updating 'All Data': {e}")
+
+    # Summary
+    end_ts = datetime.now()
+    duration = (end_ts - start_ts).total_seconds()
+    total_records = len(all_data_rows)
+    
+    print(f"\n🎯 Scrape completed in {duration:.1f}s")
+    print(f"📊 Total records processed: {total_records}")
+    print(f"📅 County sheets show next 30 days ({start_ts.strftime('%Y-%m-%d')} to {(start_ts + timedelta(days=29)).strftime('%Y-%m-%d')})")
+    print(f"🗂️  'All Data' sheet contains all records (no date filtering)")
+    print(f"🎨 New records highlighted in light green")
+
 
 if __name__ == "__main__":
     try:
