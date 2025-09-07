@@ -1,20 +1,29 @@
-import httpx
-import time
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
-import json
 import re
-from datetime import datetime, timedelta
+import json
+import time
+import httpx
+import logging
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
+
+from selectolax.parser import HTMLParser
+
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from selectolax.parser import HTMLParser
-import logging
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # -----------------------------
 # Config
 # -----------------------------
+BASE_URL = "https://salesweb.civilview.com"
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
 TARGET_COUNTIES = [
     {"county_id": "52", "county_name": "Cape May County, NJ"},
     {"county_id": "25", "county_name": "Atlantic County, NJ"},
@@ -30,42 +39,50 @@ TARGET_COUNTIES = [
     {"county_id": "24", "county_name": "New Castle County, DE"},
 ]
 
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 POLITE_DELAY_SECONDS = 1.5
-BASE_URL = "https://salesweb.civilview.com"
 MAX_RETRIES = 3
+HTTP_TIMEOUT = 30.0
 
-# Configure logging
+# -----------------------------
+# Logging
+# -----------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('foreclosure_scraper.log')
-    ]
+        logging.FileHandler("foreclosure_scraper.log", encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
 # -----------------------------
-# EST Timezone Helper
+# Time helpers (ET)
 # -----------------------------
-def get_est_time():
-    return datetime.utcnow() - timedelta(hours=5)  # Simple UTC-5 approximation
+try:
+    from zoneinfo import ZoneInfo
+    ET_TZ = ZoneInfo("America/New_York")
+except Exception:
+    ET_TZ = timezone(timedelta(hours=-5))
 
-def get_est_date():
-    return get_est_time().date()
+def now_et():
+    return datetime.now(ET_TZ)
 
-def parse_sale_date(date_str):
-    try:
-        if " " in date_str:
-            return datetime.strptime(date_str, "%m/%d/%Y %I:%M %p")
-        else:
-            return datetime.strptime(date_str, "%m/%d/%Y")
-    except (ValueError, TypeError):
+def today_et():
+    return now_et().date()
+
+def parse_sale_date(date_str: str):
+    if not date_str:
         return None
+    for fmt in ("%m/%d/%Y %I:%M %p", "%m/%d/%Y %H:%M", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    return None
 
 # -----------------------------
-# Credential helpers
+# Credentials
 # -----------------------------
 def load_service_account_info():
     file_env = os.environ.get("GOOGLE_CREDENTIALS_FILE")
@@ -73,357 +90,165 @@ def load_service_account_info():
         if os.path.exists(file_env):
             with open(file_env, "r", encoding="utf-8") as fh:
                 return json.load(fh)
-        raise ValueError(f"GOOGLE_CREDENTIALS_FILE set but file does not exist: {file_env}")
+        raise ValueError(f"GOOGLE_CREDENTIALS_FILE set but not found: {file_env}")
 
     creds_raw = os.environ.get("GOOGLE_CREDENTIALS")
     if not creds_raw:
-        raise ValueError("Environment variable GOOGLE_CREDENTIALS (or GOOGLE_CREDENTIALS_FILE) not set.")
+        raise ValueError("GOOGLE_CREDENTIALS or GOOGLE_CREDENTIALS_FILE is required.")
 
-    creds_raw_stripped = creds_raw.strip()
-    if creds_raw_stripped.startswith("{"):
-        return json.loads(creds_raw)
+    txt = creds_raw.strip()
+    if txt.startswith("{"):
+        return json.loads(txt)
 
     if os.path.exists(creds_raw):
         with open(creds_raw, "r", encoding="utf-8") as fh:
             return json.load(fh)
 
-    raise ValueError("GOOGLE_CREDENTIALS is invalid JSON and not an existing file path.")
+    raise ValueError("GOOGLE_CREDENTIALS is neither valid JSON nor an existing file path.")
 
 def init_sheets_service_from_env():
     info = load_service_account_info()
     creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-    return build('sheets', 'v4', credentials=creds)
+    svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    sa_email = info.get("client_email", "<unknown-service-account>")
+    logger.info(f"Google Sheets initialized. Service account: {sa_email}")
+    logger.info("Ensure this email has Editor access to your spreadsheet.")
+    return svc, sa_email
 
 # -----------------------------
-# Sheets client wrapper
+# Google Sheets wrapper
 # -----------------------------
 class SheetsClient:
     def __init__(self, spreadsheet_id: str, service):
         self.spreadsheet_id = spreadsheet_id
-        self.service = service
-        self.svc = self.service.spreadsheets()
+        self.svc = service.spreadsheets()
 
     def spreadsheet_info(self):
         try:
-            return self.svc.get(spreadsheetId=self.spreadsheet_id).execute()
-        except HttpError:
-            return {}
+            info = self.svc.get(spreadsheetId=self.spreadsheet_id).execute()
+            title = info.get("properties", {}).get("title", "")
+            logger.info(f"Connected to spreadsheet: {title}")
+            return info
+        except HttpError as e:
+            logger.error(f"Failed to open spreadsheet: {e}")
+            raise
 
-    def sheet_exists(self, sheet_name: str) -> bool:
+    def _get_sheet_id(self, sheet_name: str):
         info = self.spreadsheet_info()
-        for s in info.get('sheets', []):
-            if s['properties']['title'] == sheet_name:
-                return True
-        return False
+        for s in info.get("sheets", []):
+            if s["properties"]["title"] == sheet_name:
+                return s["properties"]["sheetId"]
+        return None
+
+    def sheet_exists(self, sheet_name: str):
+        return self._get_sheet_id(sheet_name) is not None
 
     def create_sheet_if_missing(self, sheet_name: str):
         if self.sheet_exists(sheet_name):
             return
-        req = {"addSheet": {"properties": {"title": sheet_name}}}
-        self.svc.batchUpdate(spreadsheetId=self.spreadsheet_id, body={"requests": [req]}).execute()
+        try:
+            self.svc.batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]},
+            ).execute()
+            logger.info(f"Created sheet: {sheet_name}")
+        except HttpError as e:
+            logger.error(f"Error creating sheet {sheet_name}: {e}")
+            raise
 
     def get_values(self, sheet_name: str, rng: str = "A:Z"):
         try:
-            res = self.svc.values().get(spreadsheetId=self.spreadsheet_id, range=f"'{sheet_name}'!{rng}").execute()
+            res = self.svc.values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{sheet_name}'!{rng}"
+            ).execute()
             return res.get("values", [])
-        except HttpError:
+        except HttpError as e:
+            logger.error(f"Error reading range {sheet_name}!{rng}: {e}")
             return []
 
     def clear(self, sheet_name: str, rng: str = "A:Z"):
         try:
-            self.svc.values().clear(spreadsheetId=self.spreadsheet_id, range=f"'{sheet_name}'!{rng}").execute()
-        except HttpError:
-            pass
+            self.svc.values().clear(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{sheet_name}'!{rng}"
+            ).execute()
+        except HttpError as e:
+            logger.error(f"Error clearing range {sheet_name}!{rng}: {e}")
+            raise
 
     def write_values(self, sheet_name: str, values, start_cell: str = "A1"):
-        self.svc.values().update(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"'{sheet_name}'!{start_cell}",
-            valueInputOption="USER_ENTERED",
-            body={"values": values}
-        ).execute()
-
-    def _get_sheet_id(self, sheet_name: str):
-        info = self.spreadsheet_info()
-        for s in info.get('sheets', []):
-            if s['properties']['title'] == sheet_name:
-                return s['properties']['sheetId']
-        return None
-
-    def highlight_new_rows(self, sheet_name: str, new_row_indices: list):
-        if not new_row_indices:
-            return
-        sheet_id = self._get_sheet_id(sheet_name)
-        if sheet_id is None:
-            return
-        requests = []
-        for row_idx in new_row_indices:
-            requests.append({
-                "repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": row_idx,
-                        "endRowIndex": row_idx + 1,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": 10
-                    },
-                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.85,"green": 0.92,"blue": 0.83}}},
-                    "fields": "userEnteredFormat.backgroundColor"
-                }
-            })
-        if requests:
-            self.svc.batchUpdate(spreadsheetId=self.spreadsheet_id, body={"requests": requests}).execute()
+        try:
+            self.svc.values().update(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{sheet_name}'!{start_cell}",
+                valueInputOption="USER_ENTERED",
+                body={"values": values},
+            ).execute()
+        except HttpError as e:
+            logger.error(f"Error writing to {sheet_name}!{start_cell}: {e}")
+            raise
 
     def format_sheet(self, sheet_name: str, num_columns: int):
-        """Apply formatting to make the sheet more readable"""
         sheet_id = self._get_sheet_id(sheet_name)
         if sheet_id is None:
             return
-            
         requests = [
-            # Format header row
+            # Snapshot row (row 1)
             {
                 "repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": 1,
-                        "endRowIndex": 2,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": num_columns
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "backgroundColor": {"red": 0.2, "green": 0.4, "blue": 0.6},
-                            "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}
-                        }
-                    },
+                    "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": num_columns},
+                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.92, "green": 0.92, "blue": 0.92}, "textFormat": {"bold": True, "italic": True}}},
                     "fields": "userEnteredFormat(backgroundColor,textFormat)"
                 }
             },
-            # Format snapshot header
+            # Header row (row 2)
             {
                 "repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": 0,
-                        "endRowIndex": 1,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": num_columns
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9},
-                            "textFormat": {"bold": True, "italic": True}
-                        }
-                    },
+                    "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": num_columns},
+                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.2, "green": 0.4, "blue": 0.6}, "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}},
                     "fields": "userEnteredFormat(backgroundColor,textFormat)"
                 }
             },
-            # Set column widths
-            {
-                "updateDimensionProperties": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "dimension": "COLUMNS",
-                        "startIndex": 0,
-                        "endIndex": num_columns
-                    },
-                    "properties": {"pixelSize": 150},
-                    "fields": "pixelSize"
-                }
-            },
-            # Freeze header row
+            # Freeze top 2 rows
             {
                 "updateSheetProperties": {
-                    "properties": {
-                        "sheetId": sheet_id,
-                        "gridProperties": {"frozenRowCount": 2}
-                    },
+                    "properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": 2}},
                     "fields": "gridProperties.frozenRowCount"
                 }
-            }
+            },
+            # Auto-resize columns
+            {
+                "autoResizeDimensions": {
+                    "dimensions": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": num_columns}
+                }
+            },
         ]
-        
         try:
             self.svc.batchUpdate(spreadsheetId=self.spreadsheet_id, body={"requests": requests}).execute()
         except HttpError as e:
             logger.warning(f"Could not format sheet {sheet_name}: {e}")
 
-    def prepend_snapshot(self, sheet_name: str, header_row, new_rows, new_row_indices=None):
-        if not new_rows:
-            return
-        est_now = get_est_time()
-        start_date = get_est_date()
-        end_date = start_date + timedelta(days=30)
-        snapshot_header = [[f"Snapshot for {est_now.strftime('%A - %Y-%m-%d')} - Showing sales from {start_date.strftime('%m/%d/%Y')} to {end_date.strftime('%m/%d/%Y')}"]]
-        
-        payload = snapshot_header + [header_row] + new_rows
+    def prepend_snapshot(self, sheet_name: str, header_row, new_rows):
+        # Keep behavior: prepend a snapshot header + header + new rows, then old content
+        snap = [[f"Snapshot for {now_et().strftime('%A - %Y-%m-%d %H:%M %Z')}"]]
         existing = self.get_values(sheet_name, "A:Z")
+        payload = snap + [header_row] + new_rows + (existing if existing else [])
         self.clear(sheet_name, "A:Z")
-        self.write_values(sheet_name, payload + existing)
-        
-        # Format the sheet
+        self.write_values(sheet_name, payload, "A1")
         self.format_sheet(sheet_name, len(header_row))
-        
-        if new_row_indices:
-            adjusted_indices = [idx + len(snapshot_header) + 1 for idx in new_row_indices]
-            self.highlight_new_rows(sheet_name, adjusted_indices)
+        logger.info(f"Prepended snapshot to '{sheet_name}' with {len(new_rows)} new rows")
 
     def overwrite_with_snapshot(self, sheet_name: str, header_row, all_rows):
-        est_now = get_est_time()
-        start_date = get_est_date()
-        end_date = start_date + timedelta(days=30)
-        snapshot_header = [[f"Snapshot for {est_now.strftime('%A - %Y-%m-%d')} - Showing sales from {start_date.strftime('%m/%d/%Y')} to {end_date.strftime('%m/%d/%Y')}"]]
-        
+        snap = [[f"Snapshot for {now_et().strftime('%A - %Y-%m-%d %H:%M %Z')}"]]
+        payload = snap + [header_row] + all_rows
         self.clear(sheet_name, "A:Z")
-        self.write_values(sheet_name, snapshot_header + [header_row] + all_rows)
-        
-        # Format the sheet
+        self.write_values(sheet_name, payload, "A1")
         self.format_sheet(sheet_name, len(header_row))
-        
-    def write_summary(self, all_data_rows, new_data_rows):
-        sheet_name = "Summary"
-        self.create_sheet_if_missing(sheet_name)
-        self.clear(sheet_name, "A:Z")
-
-        # Build summary
-        total_properties = len(all_data_rows)
-        total_new = len(new_data_rows)
-
-        # Count by county
-        county_totals = {}
-        county_new = {}
-        for row in all_data_rows:
-            county_totals[row["County"]] = county_totals.get(row["County"], 0) + 1
-        for row in new_data_rows:
-            county_new[row["County"]] = county_new.get(row["County"], 0) + 1
-
-        summary_values = [
-            ["Foreclosure Sales Summary Dashboard"],
-            [f"Snapshot for {get_est_time().strftime('%A - %Y-%m-%d %H:%M EST')}"],
-            [f"Showing sales from {get_est_date().strftime('%m/%d/%Y')} to {(get_est_date() + timedelta(days=30)).strftime('%m/%d/%Y')}"],
-            [""],
-            ["Overall Totals"],
-            ["Total Properties", total_properties],
-            ["New Properties (This Run)", total_new],
-            [""],
-            ["Breakdown by County"],
-            ["County", "Total Properties", "New This Run"],
-        ]
-
-        for county, total in county_totals.items():
-            summary_values.append([
-                county,
-                total,
-                county_new.get(county, 0)
-            ])
-
-        # Write to sheet
-        self.write_values(sheet_name, summary_values)
-        
-        # Format summary sheet
-        sheet_id = self._get_sheet_id(sheet_name)
-        if sheet_id:
-            requests = [
-                # Format title
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 0,
-                            "endRowIndex": 1,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": 3
-                        },
-                        "cell": {
-                            "userEnteredFormat": {
-                                "textFormat": {"bold": True, "fontSize": 16}
-                            }
-                        },
-                        "fields": "userEnteredFormat.textFormat"
-                    }
-                },
-                # Format subtitle
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 1,
-                            "endRowIndex": 3,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": 3
-                        },
-                        "cell": {
-                            "userEnteredFormat": {
-                                "textFormat": {"italic": True}
-                            }
-                        },
-                        "fields": "userEnteredFormat.textFormat"
-                    }
-                },
-                # Format section headers
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 4,
-                            "endRowIndex": 5,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": 3
-                        },
-                        "cell": {
-                            "userEnteredFormat": {
-                                "textFormat": {"bold": True}
-                            }
-                        },
-                        "fields": "userEnteredFormat.textFormat"
-                    }
-                },
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 8,
-                            "endRowIndex": 9,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": 3
-                        },
-                        "cell": {
-                            "userEnteredFormat": {
-                                "textFormat": {"bold": True}
-                            }
-                        },
-                        "fields": "userEnteredFormat.textFormat"
-                    }
-                },
-                # Format table header
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 9,
-                            "endRowIndex": 10,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": 3
-                        },
-                        "cell": {
-                            "userEnteredFormat": {
-                                "backgroundColor": {"red": 0.2, "green": 0.4, "blue": 0.6},
-                                "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}
-                            }
-                        },
-                        "fields": "userEnteredFormat(backgroundColor,textFormat)"
-                    }
-                }
-            ]
-            
-            try:
-                self.svc.batchUpdate(spreadsheetId=self.spreadsheet_id, body={"requests": requests}).execute()
-            except HttpError as e:
-                logger.warning(f"Could not format summary sheet: {e}")
+        logger.info(f"Wrote full snapshot to '{sheet_name}' with {len(all_rows)} rows")
 
 # -----------------------------
-# Scraper helpers
+# Scrape helpers
 # -----------------------------
 def norm_text(s: str) -> str:
     if not s:
@@ -438,98 +263,52 @@ def extract_property_id_from_href(href: str) -> str:
         return ""
 
 def extract_approx_judgment(html_content: str, county_id: str) -> str:
-    """Extract Approx Judgment from property details page with county-specific logic"""
     tree = HTMLParser(html_content)
     text_content = tree.text()
-    
-    # County-specific patterns
-    county_patterns = {
-        # Default patterns for most counties
-        "default": [
-            r'Judgment[^$]*?\$([\d,]+)',
-            r'\$([\d,]+)[^$]*?Judgment',
-            r'Judgment Amount[^$]*?\$([\d,]+)',
-            r'Approximate Judgment[^$]*?\$([\d,]+)',
-            r'Approx\. Judgment[^$]*?\$([\d,]+)',
-            r'Approx Judgment[^$]*?\$([\d,]+)',
-            r'Upset Price[^$]*?\$([\d,]+)',
-            r'Approx\. Upset[^$]*?\$([\d,]+)',
-            r'Debt Amount[^$]*?\$([\d,]+)',
-        ],
-        # Additional patterns for specific counties if needed
-        "24": [  # New Castle County, DE
-            r'Upset[^$]*?\$([\d,]+)',
-            r'Amount Due[^$]*?\$([\d,]+)',
-        ]
-    }
-    
-    # Try county-specific patterns first
-    patterns = county_patterns.get(county_id, []) + county_patterns["default"]
-    
-    for pattern in patterns:
-        match = re.search(pattern, text_content, re.IGNORECASE)
-        if match:
-            return f"${match.group(1)}"
-    
-    # If no judgment found, try to find any large dollar amounts
-    large_amounts = re.findall(r'\$([\d,]{4,})', text_content)
-    if large_amounts:
-        return f"${large_amounts[0]}"
-    
-    return "N/A"
+    patterns = [
+        r'Approx(?:imate|\.)?\s*Judgment[^$]*\$(\d[\d,]*)',
+        r'Judgment Amount[^$]*\$(\d[\d,]*)',
+        r'Approx(?:imate|\.)?\s*Upset[^$]*\$(\d[\d,]*)',
+        r'Upset Price[^$]*\$(\d[\d,]*)',
+        r'Debt Amount[^$]*\$(\d[\d,]*)',
+    ]
+    if county_id == "24":
+        patterns = [r'Upset[^$]*\$(\d[\d,]*)', r'Amount Due[^$]*\$(\d[\d,]*)'] + patterns
+    for p in patterns:
+        m = re.search(p, text_content, re.IGNORECASE)
+        if m:
+            return f"${m.group(1)}"
+    any_money = re.findall(r"\$(\d[\d,]{3,})", text_content)
+    if any_money:
+        return f"${any_money[0]}"
+    return ""
 
 def extract_sale_type(html_content: str, county_id: str) -> str:
-    """Extract Sale Type from property details page"""
-    if county_id != "24":  # Only New Castle County has Sale Type
+    if county_id != "24":
         return ""
-    
     tree = HTMLParser(html_content)
-    
-    # Look for sale type information in various possible locations
-    sale_type_patterns = [
-        r'Sale Type[^:]*:([^\n\r]*)',
-        r'Type of Sale[^:]*:([^\n\r]*)',
-        r'Sale Type</span>[^<]*<span[^>]*>([^<]*)',
-    ]
-    
-    text_content = tree.text()
-    html_content_lower = html_content.lower()
-    
-    for pattern in sale_type_patterns:
-        match = re.search(pattern, text_content, re.IGNORECASE)
-        if match:
-            return norm_text(match.group(1))
-    
-    # Try to find in HTML structure
-    sale_type_labels = tree.css('span, div, td')
-    for element in sale_type_labels:
-        text = norm_text(element.text())
-        if text and "sale type" in text.lower():
-            # Look for the value in sibling or parent elements
-            next_element = element.next
-            while next_element and not norm_text(next_element.text()):
-                next_element = next_element.next
-            
-            if next_element and norm_text(next_element.text()):
-                return norm_text(next_element.text())
-    
+    text = tree.text()
+    for p in [r"Sale Type\s*:\s*([^\n\r]+)", r"Type of Sale\s*:\s*([^\n\r]+)"]:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            return norm_text(m.group(1))
     return "Unknown"
 
 # -----------------------------
-# Foreclosure Scraper (httpx version)
+# HTTP scraper
 # -----------------------------
 class ForeclosureScraper:
-    def __init__(self, sheets_client):
-        self.sheets_client = sheets_client
+    def __init__(self):
+        pass
 
     @retry(
         stop=stop_after_attempt(MAX_RETRIES),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError))
+        wait=wait_exponential(multiplier=1, min=2, max=8),
+        retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError)),
     )
     def load_search_page(self, client: httpx.Client, county_id: str):
         url = f"{BASE_URL}/Sales/SalesSearch?countyId={county_id}"
-        r = client.get(url)
+        r = client.get(url, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         return HTMLParser(r.text)
 
@@ -542,219 +321,306 @@ class ForeclosureScraper:
 
     @retry(
         stop=stop_after_attempt(MAX_RETRIES),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError))
+        wait=wait_exponential(multiplier=1, min=2, max=8),
+        retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError)),
     )
-    def get_property_details(self, client: httpx.Client, property_id: str, county_id: str):
-        """Get additional details including Approx Judgment from property page"""
-        if not property_id:
-            return {"Approx Judgment": "N/A", "Sale Type": "Unknown" if county_id == "24" else ""}
-            
-        url = f"{BASE_URL}/Sales/SaleDetails?PropertyId={property_id}"
-        try:
-            r = client.get(url)
-            r.raise_for_status()
-            judgment = extract_approx_judgment(r.text, county_id)
-            sale_type = extract_sale_type(r.text, county_id)
-            
-            return {"Approx Judgment": judgment, "Sale Type": sale_type}
-        except Exception as e:
-            logger.warning(f"Could not fetch details for property {property_id}: {e}")
-            return {"Approx Judgment": "N/A", "Sale Type": "Unknown" if county_id == "24" else ""}
+    def post_search(self, client: httpx.Client, county_id: str, hidden: dict):
+        url = f"{BASE_URL}/Sales/SalesSearch?countyId={county_id}"
+        payload = {
+            "__VIEWSTATE": hidden.get("__VIEWSTATE", ""),
+            "__VIEWSTATEGENERATOR": hidden.get("__VIEWSTATEGENERATOR", ""),
+            "__EVENTVALIDATION": hidden.get("__EVENTVALIDATION", ""),
+            "IsOpen": "true",
+            "btnSearch": "Search",
+        }
+        r = client.post(url, data=payload, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        return HTMLParser(r.text)
 
     @retry(
         stop=stop_after_attempt(MAX_RETRIES),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError))
+        wait=wait_exponential(multiplier=1, min=2, max=8),
+        retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError)),
     )
-    def post_search_and_extract(self, client: httpx.Client, county_id: str, hidden: dict, county_name: str):
-        url = f"{BASE_URL}/Sales/SalesSearch?countyId={county_id}"
-        payload = {
-            "__VIEWSTATE": hidden["__VIEWSTATE"],
-            "__VIEWSTATEGENERATOR": hidden["__VIEWSTATEGENERATOR"],
-            "__EVENTVALIDATION": hidden["__EVENTVALIDATION"],
-            "IsOpen": "true",   # forces the table open
-            "btnSearch": "Search",
-        }
-        r = client.post(url, data=payload)
+    def fetch_details(self, client: httpx.Client, property_id: str):
+        if not property_id:
+            return ""
+        url = f"{BASE_URL}/Sales/SaleDetails?PropertyId={property_id}"
+        r = client.get(url, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
-        tree = HTMLParser(r.text)
+        return r.text
 
-        # Get table headers
-        headers = []
-        header_ths = tree.css("table thead th")
-        for th in header_ths:
-            headers.append(norm_text(th.text()))
-        
-        # Extract rows
-        rows = []
+    def extract_rows(self, tree: HTMLParser, county):
+        # Headers
+        headers = [norm_text(th.text()) for th in tree.css("table thead th")]
+        if not headers:
+            # sometimes header row is built differently
+            thead_tr = tree.css_first("table thead tr")
+            if thead_tr:
+                headers = [norm_text(n.text()) for n in thead_tr.css("th")]
+        # Normalize column keys for later mapping
+        header_lower = [h.lower() for h in headers]
+
+        rows_out = []
         for tr in tree.css("table tbody tr"):
-            cols = [norm_text(td.text()) for td in tr.css("td")]
-            if cols and len(cols) == len(headers):
-                # Extract property ID from link if available
-                link = tr.css_first("td a")
-                href = link.attributes.get("href", "") if link else ""
-                property_id = extract_property_id_from_href(href)
-                
-                # Create row dict with all available data
-                row_dict = dict(zip(headers, cols))
-                row_dict["Property ID"] = property_id
-                row_dict["County"] = county_name
-                
-                # Get additional details including Approx Judgment and Sale Type
-                details = self.get_property_details(client, property_id, county_id)
-                row_dict.update(details)
-                
-                rows.append(row_dict)
-        
-        return headers, rows
+            tds = tr.css("td")
+            if not tds:
+                continue
+            cols = [norm_text(td.text()) for td in tds]
+            # property link
+            link = tr.css_first("td a")
+            href = link.attributes.get("href", "") if link else ""
+            pid = extract_property_id_from_href(href)
 
-    def scrape_county_sales(self, county):
-        for attempt in range(MAX_RETRIES):
+            row_map = dict(zip(headers, cols))
+
+            # Basic extraction by header names
+            address = ""
+            defendant = ""
+            sale_date = ""
+
+            # flexible mapping like Playwright version
+            for i, h in enumerate(header_lower):
+                if "address" in h and i < len(cols) and not address:
+                    address = cols[i]
+                if "defendant" in h and i < len(cols) and not defendant:
+                    defendant = cols[i]
+                if "sale" in h and "date" in h and i < len(cols) and not sale_date:
+                    sale_date = cols[i]
+
+            rows_out.append({
+                "Property ID": pid or "",
+                "Address": address or row_map.get("Address", ""),
+                "Defendant": defendant or row_map.get("Defendant", ""),
+                # Use "Sale Date" (not "Sales Date") to standardize
+                "Sale Date": sale_date or row_map.get("Sale Date", "") or row_map.get("Sales Date", ""),
+                "County": county["county_name"],
+            })
+
+        return rows_out
+
+    def scrape_county(self, county):
+        client = httpx.Client(follow_redirects=True, timeout=HTTP_TIMEOUT)
+        try:
+            logger.info(f"Loading search page for {county['county_name']}")
+            tree = self.load_search_page(client, county["county_id"])
+            hidden = self.get_hidden_inputs(tree)
+
+            logger.info(f"Searching {county['county_name']} (all records)")
+            results_tree = self.post_search(client, county["county_id"], hidden)
+
+            rows = self.extract_rows(results_tree, county)
+
+            # Fetch detail pages for Approx Judgment (+ Sale Type for 24)
+            enriched = []
+            for r in rows:
+                details_html = ""
+                if r["Property ID"]:
+                    try:
+                        details_html = self.fetch_details(client, r["Property ID"])
+                    except Exception as e:
+                        logger.warning(f"Details fetch failed for {county['county_name']} PID={r['Property ID']}: {e}")
+
+                approx = extract_approx_judgment(details_html, county["county_id"]) if details_html else ""
+                sale_type = extract_sale_type(details_html, county["county_id"]) if details_html else ("Unknown" if county["county_id"] == "24" else "")
+
+                r["Approx Judgment"] = approx
+                if county["county_id"] == "24":
+                    r["Sale Type"] = sale_type
+                enriched.append(r)
+
+            logger.info(f"  ✓ {len(enriched)} rows found")
+            return enriched
+        finally:
             try:
-                client = httpx.Client(follow_redirects=True, timeout=30.0)
-                logger.info(f"[Attempt {attempt+1}/{MAX_RETRIES}] Loading search page for {county['county_name']}")
-                tree = self.load_search_page(client, county["county_id"])
-                hidden = self.get_hidden_inputs(tree)
-
-                logger.info(f"[Attempt {attempt+1}/{MAX_RETRIES}] Searching {county['county_name']} (all records)")
-                headers, rows = self.post_search_and_extract(client, county["county_id"], hidden, county["county_name"])
-                logger.info(f"  ✓ {len(rows)} rows found")
-                
                 client.close()
-                return rows
-            except Exception as e:
-                logger.error(f"  ✗ Error scraping {county['county_name']} (Attempt {attempt+1}): {e}")
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                else:
-                    logger.error(f"  ✗ Failed to scrape {county['county_name']} after {MAX_RETRIES} attempts")
-            finally:
-                try:
-                    client.close()
-                except:
-                    pass
-                time.sleep(POLITE_DELAY_SECONDS)
-        
-        return []
+            except:
+                pass
+            time.sleep(POLITE_DELAY_SECONDS)
 
 # -----------------------------
 # Orchestration
 # -----------------------------
 def run():
-    logger.info("Starting foreclosure scraper")
-    
+    logger.info("Starting foreclosure scraper (httpx lightweight)")
+
     spreadsheet_id = os.environ.get("SPREADSHEET_ID")
     if not spreadsheet_id:
-        logger.error("✗ SPREADSHEET_ID env var is required.")
+        logger.error("SPREADSHEET_ID is required.")
         return
 
     try:
-        service = init_sheets_service_from_env()
-        logger.info("Google Sheets service initialized successfully")
+        service, sa_email = init_sheets_service_from_env()
     except Exception as e:
-        logger.error(f"✗ Failed to initialize Google Sheets service: {e}")
+        logger.error(f"Failed to initialize Sheets service: {e}")
         return
 
-    sheets_client = SheetsClient(spreadsheet_id, service)
-    scraper = ForeclosureScraper(sheets_client)
+    sheets = SheetsClient(spreadsheet_id, service)
+    try:
+        sheets.spreadsheet_info()
+    except Exception:
+        logger.error("Cannot access spreadsheet. Verify ID and permissions (share with service account).")
+        return
 
-    all_data_rows = []
-    successful_counties = 0
-    
+    scraper = ForeclosureScraper()
+
+    all_rows = []
+    success_cty = 0
     for county in TARGET_COUNTIES:
-        county_rows = scraper.scrape_county_sales(county)
-        if county_rows:
-            all_data_rows.extend(county_rows)
-            successful_counties += 1
-            logger.info(f"Successfully processed {county['county_name']} with {len(county_rows)} records")
-        else:
-            logger.warning(f"Failed to process {county['county_name']}")
+        try:
+            county_rows = scraper.scrape_county(county)
+            if county_rows:
+                all_rows.extend(county_rows)
+                success_cty += 1
+                logger.info(f"Successfully processed {county['county_name']} with {len(county_rows)} records")
+            else:
+                logger.info(f"No rows for {county['county_name']}")
+        except Exception as e:
+            logger.error(f"Error scraping {county['county_name']}: {e}")
 
-    # Filter to only include records within the next 30 days
-    today = get_est_date()
-    thirty_days_later = today + timedelta(days=30)
-    
-    filtered_data_rows = []
-    for row in all_data_rows:
-        sale_date_str = row.get("Sale Date", "") or row.get("Sale date", "") or row.get("sale date", "")
-        sale_date = parse_sale_date(sale_date_str)
-        if sale_date and today <= sale_date.date() <= thirty_days_later:
-            filtered_data_rows.append(row)
+    # Filter to next 30 days
+    start = today_et()
+    end = start + timedelta(days=30)
+    def within_30(row):
+        dt = parse_sale_date(row.get("Sale Date", ""))
+        return bool(dt and start <= dt.date() <= end)
 
-    logger.info(f"Filtered {len(filtered_data_rows)} records within the 30-day window from {len(all_data_rows)} total records")
+    filtered = [r for r in all_rows if within_30(r)]
+    logger.info(f"Filtered {len(filtered)} records within the 30-day window from {len(all_rows)} total")
 
-    # Define the standard column order we want
-    standard_columns = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment", "Sale Type", "County"]
-    
-    # Reorganize all rows to have the standard column order
-    standardized_rows = []
-    for row in filtered_data_rows:
-        standardized_row = {}
-        for col in standard_columns:
-            standardized_row[col] = row.get(col, "")
-        standardized_rows.append(standardized_row)
+    # Standard columns
+    base_cols = ["Property ID", "Address", "Defendant", "Sale Date", "Approx Judgment", "County"]
+    all_cols = base_cols + (["Sale Type"] if any(c["county_id"] == "24" for c in TARGET_COUNTIES) else [])
 
-    # Separate per-county sheets
+    # Normalize rows to standard columns
+    def normalize(row: dict):
+        out = {
+            "Property ID": row.get("Property ID", ""),
+            "Address": row.get("Address", ""),
+            "Defendant": row.get("Defendant", ""),
+            "Sale Date": row.get("Sale Date", "") or row.get("Sales Date", ""),
+            "Approx Judgment": row.get("Approx Judgment", ""),
+            "County": row.get("County", ""),
+        }
+        if "Sale Type" in all_cols:
+            out["Sale Type"] = row.get("Sale Type", "") if row.get("County") == "New Castle County, DE" else ""
+        return out
+
+    standardized = [normalize(r) for r in filtered]
+
+    # Per-county sheets
     for county in TARGET_COUNTIES:
-        sheet_name = county['county_name']
-        sheets_client.create_sheet_if_missing(sheet_name)
-        county_rows = [r for r in standardized_rows if r["County"] == county['county_name']]
+        tab = county["county_name"][:30]  # keep <=30 like your Playwright run
+        sheets.create_sheet_if_missing(tab)
+        county_rows = [r for r in standardized if r["County"] == county["county_name"]]
         if not county_rows:
-            logger.info(f"No records for {county['county_name']} within the 30-day window")
+            logger.info(f"No records for {county['county_name']} within window.")
             continue
-        
-        # Convert to list of lists for Google Sheets
-        county_data = [[row[col] for col in standard_columns] for row in county_rows]
-        
-        # Get existing data to identify new rows
-        existing_values = sheets_client.get_values(sheet_name)
-        existing_ids = {r[0] for r in existing_values[2:] if r and len(r) > 0} if existing_values else set()
-        
-        # Identify new rows
-        new_rows = []
-        new_row_indices = []
-        for i, row in enumerate(county_data):
-            if row[0] not in existing_ids:  # Property ID is first column
-                new_rows.append(row)
-                new_row_indices.append(i)
-        
-        if not existing_values or len(existing_values) <= 2:  # Only header or empty
-            sheets_client.overwrite_with_snapshot(sheet_name, standard_columns, county_data)
-            logger.info(f"Created new sheet for {county['county_name']} with {len(county_data)} records")
-        else:
-            sheets_client.prepend_snapshot(sheet_name, standard_columns, new_rows, new_row_indices)
-            logger.info(f"Updated sheet for {county['county_name']} with {len(new_rows)} new records")
 
-    # "All Data" sheet
-    all_sheet = "All Data"
-    sheets_client.create_sheet_if_missing(all_sheet)
-    if standardized_rows:
-        all_data = [[row[col] for col in standard_columns] for row in standardized_rows]
-        
-        existing_all = sheets_client.get_values(all_sheet)
-        existing_all_ids = {r[0] for r in existing_all[2:] if r and len(r) > 0} if existing_all else set()
-        
-        new_all_rows = []
-        new_all_indices = []
-        for i, row in enumerate(all_data):
-            if row[0] not in existing_all_ids:
-                new_all_rows.append(row)
-                new_all_indices.append(i)
-        
-        if not existing_all or len(existing_all) <= 2:
-            sheets_client.overwrite_with_snapshot(all_sheet, standard_columns, all_data)
-            logger.info(f"Created new 'All Data' sheet with {len(all_data)} records")
+        # Dynamic header per county: omit County in the sheet like Playwright code
+        cols = [c for c in all_cols if c != "County"]
+        if county["county_id"] != "24" and "Sale Type" in cols:
+            # hide Sale Type column for non-24 county sheets
+            cols = [c for c in cols if c != "Sale Type"]
+
+        data_rows = [[row.get(c, "") for c in cols] for row in county_rows]
+        header = cols
+
+        existing = sheets.get_values(tab, "A:Z")
+        if not existing or len(existing) <= 2:
+            sheets.overwrite_with_snapshot(tab, header, data_rows)
+            logger.info(f"Created new sheet for {county['county_name']} with {len(data_rows)} rows")
         else:
-            sheets_client.prepend_snapshot(all_sheet, standard_columns, new_all_rows, new_all_indices)
-            logger.info(f"Updated 'All Data' sheet with {len(new_all_rows)} new records")
-    
-    # Summary sheet
-    new_data_rows = [r for r in standardized_rows if r["Property ID"] not in existing_all_ids] if existing_all and len(existing_all) > 2 else standardized_rows
-    sheets_client.write_summary(standardized_rows, new_data_rows)
-    logger.info(f"Updated summary sheet with {len(standardized_rows)} total records and {len(new_data_rows)} new records")
-    
-    logger.info(f"[SUCCESS] Scraping completed. Processed {successful_counties}/{len(TARGET_COUNTIES)} counties with {len(standardized_rows)} records within the 30-day window.")
+            # Find existing Property IDs (first data column)
+            existing_ids = set()
+            # try to find the header row index (first 5 rows)
+            header_idx = None
+            for idx, row in enumerate(existing[:5]):
+                if row and row[0].strip().lower().replace(" ", "") in {"propertyid", "propertyid*"}:
+                    header_idx = idx
+                    break
+            if header_idx is None:
+                header_idx = 1 if len(existing) > 1 else 0
+
+            for r in existing[header_idx + 1:]:
+                if not r or (len(r) == 1 and r[0].strip() == ""):
+                    continue
+                pid = (r[0] if len(r) > 0 else "").strip()
+                if pid:
+                    existing_ids.add(pid)
+
+            new_rows = [row for row in data_rows if (row[0] or "").strip() not in existing_ids]
+            if new_rows:
+                sheets.prepend_snapshot(tab, header, new_rows)
+                logger.info(f"Updated sheet for {county['county_name']} with {len(new_rows)} new rows")
+            else:
+                # still add a timestamped snapshot header (no new rows)
+                sheets.prepend_snapshot(tab, header, [])
+                logger.info(f"No new rows for {county['county_name']}. Snapshot header added.")
+
+    # All Data sheet
+    all_sheet = "All Data"
+    sheets.create_sheet_if_missing(all_sheet)
+
+    # Build all data rows with the full header all_cols
+    all_data_rows = [[row.get(c, "") for c in all_cols] for row in standardized]
+
+    existing = sheets.get_values(all_sheet, "A:Z")
+    if not existing or len(existing) <= 2:
+        if all_data_rows:
+            sheets.overwrite_with_snapshot(all_sheet, all_cols, all_data_rows)
+            logger.info(f"Created 'All Data' with {len(all_data_rows)} rows")
+        else:
+            logger.info("No rows to write to 'All Data'")
+    else:
+        # Build set of (County, Property ID) pairs like your Playwright logic
+        existing_pairs = set()
+        header_idx = None
+        for idx, row in enumerate(existing[:5]):
+            if row and row[0].strip().lower().replace(" ", "") in {"propertyid", "propertyid*"}:
+                header_idx = idx
+                break
+        if header_idx is None:
+            header_idx = 1 if len(existing) > 1 else 0
+
+        # Find County column index in existing All Data (expected index 5 if including Sale Type as last)
+        # But compute defensively from the header row we wrote previously
+        county_col_idx = 5  # default if header is ["Property ID","Address","Defendant","Sale Date","Approx Judgment","County",("Sale Type")]
+        if len(existing) > header_idx + 1:
+            header_row = existing[header_idx] if header_idx < len(existing) else []
+            try:
+                county_col_idx = header_row.index("County")
+            except ValueError:
+                pass
+
+        for r in existing[header_idx + 1:]:
+            if not r:
+                continue
+            pid = (r[0] if len(r) > 0 else "").strip()
+            cty = (r[county_col_idx] if len(r) > county_col_idx else "").strip()
+            if pid and cty:
+                existing_pairs.add((cty, pid))
+
+        new_rows = []
+        for r in all_data_rows:
+            pid = (r[0] if len(r) > 0 else "").strip()
+            # compute county index from our header definition
+            try:
+                county_idx = all_cols.index("County")
+            except ValueError:
+                county_idx = 5
+            cty = (r[county_idx] if len(r) > county_idx else "").strip()
+            if pid and cty and (cty, pid) not in existing_pairs:
+                new_rows.append(r)
+
+        if new_rows:
+            sheets.prepend_snapshot(all_sheet, all_cols, new_rows)
+            logger.info(f"Updated 'All Data' with {len(new_rows)} new rows")
+        else:
+            sheets.prepend_snapshot(all_sheet, all_cols, [])
+            logger.info("No new rows for 'All Data'. Snapshot header added.")
+
+    logger.info(f"[SUCCESS] Completed. Processed {success_cty}/{len(TARGET_COUNTIES)} counties with {len(standardized)} rows in window.")
 
 if __name__ == "__main__":
     run()
