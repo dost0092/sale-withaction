@@ -243,7 +243,7 @@ class SheetsClient:
         end_date = start_date + timedelta(days=30)
         snapshot_header = [[f"Snapshot for {est_now.strftime('%A - %Y-%m-%d')} - Showing sales from {start_date.strftime('%m/%d/%Y')} to {end_date.strftime('%m/%d/%Y')}"]]
         
-        payload = snapshot_header + [header_row] + new_rows + [[""]]
+        payload = snapshot_header + [header_row] + new_rows
         existing = self.get_values(sheet_name, "A:Z")
         self.clear(sheet_name, "A:Z")
         self.write_values(sheet_name, payload + existing)
@@ -259,10 +259,10 @@ class SheetsClient:
         est_now = get_est_time()
         start_date = get_est_date()
         end_date = start_date + timedelta(days=30)
-        snapshot_header = [[f"Snapshot for {est_now.strftime('%A - %Y-%m-%d')} - Showing sales from {start_date.strftime('%m/%d/%Y')} to {end_date.strftime('%m/%d/%Y')}"]]
+        snapshot_header = [[f"Snapshot for {est_now.strftime('%A - %Y-%m-%Y')} - Showing sales from {start_date.strftime('%m/%d/%Y')} to {end_date.strftime('%m/%d/%Y')}"]]
         
         self.clear(sheet_name, "A:Z")
-        self.write_values(sheet_name, snapshot_header + [header_row] + all_rows + [[""]])
+        self.write_values(sheet_name, snapshot_header + [header_row] + all_rows)
         
         # Format the sheet
         self.format_sheet(sheet_name, len(header_row))
@@ -435,6 +435,11 @@ def extract_approx_judgment(html_content: str) -> str:
         r'\$([\d,]+)[^$]*?Judgment',
         # Pattern 3: Common judgment phrases
         r'Judgment Amount[^$]*?\$([\d,]+)',
+        r'Approximate Judgment[^$]*?\$([\d,]+)',
+        r'Approx\. Judgment[^$]*?\$([\d,]+)',
+        r'Approx Judgment[^$]*?\$([\d,]+)',
+        r'Upset Price[^$]*?\$([\d,]+)',
+        r'Approx\. Upset[^$]*?\$([\d,]+)',
     ]
     
     text_content = tree.text()
@@ -471,20 +476,37 @@ class ForeclosureScraper:
             hidden[field] = node.attributes.get("value", "") if node else ""
         return hidden
 
-    def get_property_details(self, client: httpx.Client, property_id: str):
+    def get_property_details(self, client: httpx.Client, property_id: str, county_id: str):
         """Get additional details including Approx Judgment from property page"""
         if not property_id:
-            return {"Approx Judgment": "N/A"}
+            return {"Approx Judgment": "N/A", "Sale Type": "Unknown" if county_id == "24" else ""}
             
         url = f"{BASE_URL}/Sales/SaleDetails?PropertyId={property_id}"
         try:
             r = client.get(url)
             r.raise_for_status()
             judgment = extract_approx_judgment(r.text)
-            return {"Approx Judgment": judgment}
+            
+            # Extract sale type for New Castle County
+            sale_type = ""
+            if county_id == "24":
+                tree = HTMLParser(r.text)
+                # Look for sale type information
+                labels = tree.css(".sale-detail-label")
+                for label in labels:
+                    label_text = norm_text(label.text())
+                    if "sale type" in label_text.lower():
+                        value = label.next
+                        while value and value.tag != 'div':
+                            value = value.next
+                        if value and hasattr(value, 'text'):
+                            sale_type = norm_text(value.text())
+                        break
+            
+            return {"Approx Judgment": judgment, "Sale Type": sale_type}
         except Exception as e:
             print(f"  Warning: Could not fetch details for property {property_id}: {e}")
-            return {"Approx Judgment": "N/A"}
+            return {"Approx Judgment": "N/A", "Sale Type": "Unknown" if county_id == "24" else ""}
 
     def post_search_and_extract(self, client: httpx.Client, county_id: str, hidden: dict, county_name: str):
         url = f"{BASE_URL}/Sales/SalesSearch?countyId={county_id}"
@@ -520,13 +542,9 @@ class ForeclosureScraper:
                 row_dict["Property ID"] = property_id
                 row_dict["County"] = county_name
                 
-                # Add Sale Type based on county logic
-                row_dict["Sale Type"] = "Unknown" if county_id == "24" else ""
-                
-                # Get additional details including Approx Judgment
-                if property_id:
-                    details = self.get_property_details(client, property_id)
-                    row_dict.update(details)
+                # Get additional details including Approx Judgment and Sale Type
+                details = self.get_property_details(client, property_id, county_id)
+                row_dict.update(details)
                 
                 rows.append(row_dict)
         
