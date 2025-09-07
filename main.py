@@ -5,13 +5,12 @@ import os
 import re
 import json
 import time
-import httpx
 import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
 
+import httpx
 from selectolax.parser import HTMLParser
-
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from google.oauth2 import service_account
@@ -230,7 +229,6 @@ class SheetsClient:
             logger.warning(f"Could not format sheet {sheet_name}: {e}")
 
     def prepend_snapshot(self, sheet_name: str, header_row, new_rows):
-        # Keep behavior: prepend a snapshot header + header + new rows, then old content
         snap = [[f"Snapshot for {now_et().strftime('%A - %Y-%m-%d %H:%M %Z')}"]]
         existing = self.get_values(sheet_name, "A:Z")
         payload = snap + [header_row] + new_rows + (existing if existing else [])
@@ -351,14 +349,11 @@ class ForeclosureScraper:
         return r.text
 
     def extract_rows(self, tree: HTMLParser, county):
-        # Headers
         headers = [norm_text(th.text()) for th in tree.css("table thead th")]
         if not headers:
-            # sometimes header row is built differently
             thead_tr = tree.css_first("table thead tr")
             if thead_tr:
                 headers = [norm_text(n.text()) for n in thead_tr.css("th")]
-        # Normalize column keys for later mapping
         header_lower = [h.lower() for h in headers]
 
         rows_out = []
@@ -367,19 +362,14 @@ class ForeclosureScraper:
             if not tds:
                 continue
             cols = [norm_text(td.text()) for td in tds]
-            # property link
             link = tr.css_first("td a")
             href = link.attributes.get("href", "") if link else ""
             pid = extract_property_id_from_href(href)
 
-            row_map = dict(zip(headers, cols))
-
-            # Basic extraction by header names
+            # flexible mapping like Playwright version
             address = ""
             defendant = ""
             sale_date = ""
-
-            # flexible mapping like Playwright version
             for i, h in enumerate(header_lower):
                 if "address" in h and i < len(cols) and not address:
                     address = cols[i]
@@ -390,10 +380,9 @@ class ForeclosureScraper:
 
             rows_out.append({
                 "Property ID": pid or "",
-                "Address": address or row_map.get("Address", ""),
-                "Defendant": defendant or row_map.get("Defendant", ""),
-                # Use "Sale Date" (not "Sales Date") to standardize
-                "Sale Date": sale_date or row_map.get("Sale Date", "") or row_map.get("Sales Date", ""),
+                "Address": address,
+                "Defendant": defendant,
+                "Sale Date": sale_date,  # normalized to "Sale Date"
                 "County": county["county_name"],
             })
 
@@ -402,16 +391,16 @@ class ForeclosureScraper:
     def scrape_county(self, county):
         client = httpx.Client(follow_redirects=True, timeout=HTTP_TIMEOUT)
         try:
-            logger.info(f"Loading search page for {county['county_name']}")
+            logger.info(f"[INFO] Loading search page for {county['county_name']}")
             tree = self.load_search_page(client, county["county_id"])
             hidden = self.get_hidden_inputs(tree)
 
-            logger.info(f"Searching {county['county_name']} (all records)")
+            logger.info(f"[INFO] Searching {county['county_name']} (all records)")
             results_tree = self.post_search(client, county["county_id"], hidden)
 
             rows = self.extract_rows(results_tree, county)
 
-            # Fetch detail pages for Approx Judgment (+ Sale Type for 24)
+            # Enrich with details
             enriched = []
             for r in rows:
                 details_html = ""
@@ -420,10 +409,8 @@ class ForeclosureScraper:
                         details_html = self.fetch_details(client, r["Property ID"])
                     except Exception as e:
                         logger.warning(f"Details fetch failed for {county['county_name']} PID={r['Property ID']}: {e}")
-
                 approx = extract_approx_judgment(details_html, county["county_id"]) if details_html else ""
                 sale_type = extract_sale_type(details_html, county["county_id"]) if details_html else ("Unknown" if county["county_id"] == "24" else "")
-
                 r["Approx Judgment"] = approx
                 if county["county_id"] == "24":
                     r["Sale Type"] = sale_type
@@ -464,13 +451,13 @@ def run():
 
     scraper = ForeclosureScraper()
 
-    all_rows = []
+    all_rows_raw = []
     success_cty = 0
     for county in TARGET_COUNTIES:
         try:
             county_rows = scraper.scrape_county(county)
             if county_rows:
-                all_rows.extend(county_rows)
+                all_rows_raw.extend(county_rows)
                 success_cty += 1
                 logger.info(f"Successfully processed {county['county_name']} with {len(county_rows)} records")
             else:
@@ -481,47 +468,44 @@ def run():
     # Filter to next 30 days
     start = today_et()
     end = start + timedelta(days=30)
+
     def within_30(row):
         dt = parse_sale_date(row.get("Sale Date", ""))
         return bool(dt and start <= dt.date() <= end)
 
-    filtered = [r for r in all_rows if within_30(r)]
-    logger.info(f"Filtered {len(filtered)} records within the 30-day window from {len(all_rows)} total")
+    filtered = [r for r in all_rows_raw if within_30(r)]
+    logger.info(f"Filtered {len(filtered)} records within the 30-day window from {len(all_rows_raw)} total")
 
-    # Standard columns
-    base_cols = ["Property ID", "Address", "Defendant", "Sale Date", "Approx Judgment", "County"]
-    all_cols = base_cols + (["Sale Type"] if any(c["county_id"] == "24" for c in TARGET_COUNTIES) else [])
+    # Standard columns for All Data
+    all_cols = ["Property ID", "Address", "Defendant", "Sale Date", "Approx Judgment", "Sale Type", "County"]
 
-    # Normalize rows to standard columns
     def normalize(row: dict):
-        out = {
+        return {
             "Property ID": row.get("Property ID", ""),
             "Address": row.get("Address", ""),
             "Defendant": row.get("Defendant", ""),
-            "Sale Date": row.get("Sale Date", "") or row.get("Sales Date", ""),
+            "Sale Date": row.get("Sale Date", ""),
             "Approx Judgment": row.get("Approx Judgment", ""),
+            "Sale Type": row.get("Sale Type", "") if row.get("County") == "New Castle County, DE" else "",
             "County": row.get("County", ""),
         }
-        if "Sale Type" in all_cols:
-            out["Sale Type"] = row.get("Sale Type", "") if row.get("County") == "New Castle County, DE" else ""
-        return out
 
     standardized = [normalize(r) for r in filtered]
 
     # Per-county sheets
     for county in TARGET_COUNTIES:
-        tab = county["county_name"][:30]  # keep <=30 like your Playwright run
+        tab = county["county_name"][:30]
         sheets.create_sheet_if_missing(tab)
         county_rows = [r for r in standardized if r["County"] == county["county_name"]]
         if not county_rows:
             logger.info(f"No records for {county['county_name']} within window.")
             continue
 
-        # Dynamic header per county: omit County in the sheet like Playwright code
-        cols = [c for c in all_cols if c != "County"]
-        if county["county_id"] != "24" and "Sale Type" in cols:
-            # hide Sale Type column for non-24 county sheets
-            cols = [c for c in cols if c != "Sale Type"]
+        # Per-county header: exclude County; include Sale Type only for New Castle (24)
+        if county["county_id"] == "24":
+            cols = ["Property ID", "Address", "Defendant", "Sale Date", "Approx Judgment", "Sale Type"]
+        else:
+            cols = ["Property ID", "Address", "Defendant", "Sale Date", "Approx Judgment"]
 
         data_rows = [[row.get(c, "") for c in cols] for row in county_rows]
         header = cols
@@ -531,12 +515,11 @@ def run():
             sheets.overwrite_with_snapshot(tab, header, data_rows)
             logger.info(f"Created new sheet for {county['county_name']} with {len(data_rows)} rows")
         else:
-            # Find existing Property IDs (first data column)
+            # Build existing Property ID set from old content (first column)
             existing_ids = set()
-            # try to find the header row index (first 5 rows)
             header_idx = None
-            for idx, row in enumerate(existing[:5]):
-                if row and row[0].strip().lower().replace(" ", "") in {"propertyid", "propertyid*"}:
+            for idx, r in enumerate(existing[:5]):
+                if r and r[0].strip().lower().replace(" ", "") in {"propertyid", "propertyid*"}:
                     header_idx = idx
                     break
             if header_idx is None:
@@ -550,22 +533,20 @@ def run():
                     existing_ids.add(pid)
 
             new_rows = [row for row in data_rows if (row[0] or "").strip() not in existing_ids]
+            # Always write a snapshot header; if no new rows, prepend header only and keep existing content
+            sheets.prepend_snapshot(tab, header, new_rows)
             if new_rows:
-                sheets.prepend_snapshot(tab, header, new_rows)
                 logger.info(f"Updated sheet for {county['county_name']} with {len(new_rows)} new rows")
             else:
-                # still add a timestamped snapshot header (no new rows)
-                sheets.prepend_snapshot(tab, header, [])
                 logger.info(f"No new rows for {county['county_name']}. Snapshot header added.")
 
-    # All Data sheet
+    # All Data sheet (written once after all counties)
     all_sheet = "All Data"
     sheets.create_sheet_if_missing(all_sheet)
 
-    # Build all data rows with the full header all_cols
     all_data_rows = [[row.get(c, "") for c in all_cols] for row in standardized]
-
     existing = sheets.get_values(all_sheet, "A:Z")
+
     if not existing or len(existing) <= 2:
         if all_data_rows:
             sheets.overwrite_with_snapshot(all_sheet, all_cols, all_data_rows)
@@ -573,7 +554,7 @@ def run():
         else:
             logger.info("No rows to write to 'All Data'")
     else:
-        # Build set of (County, Property ID) pairs like your Playwright logic
+        # Compare (County, Property ID) to detect new rows
         existing_pairs = set()
         header_idx = None
         for idx, row in enumerate(existing[:5]):
@@ -583,14 +564,13 @@ def run():
         if header_idx is None:
             header_idx = 1 if len(existing) > 1 else 0
 
-        # Find County column index in existing All Data (expected index 5 if including Sale Type as last)
-        # But compute defensively from the header row we wrote previously
-        county_col_idx = 5  # default if header is ["Property ID","Address","Defendant","Sale Date","Approx Judgment","County",("Sale Type")]
-        if len(existing) > header_idx + 1:
-            header_row = existing[header_idx] if header_idx < len(existing) else []
+        # Determine County column index from existing header row if possible
+        county_col_idx = 6  # default position in all_cols
+        if header_idx < len(existing):
+            header_row = existing[header_idx]
             try:
                 county_col_idx = header_row.index("County")
-            except ValueError:
+            except Exception:
                 pass
 
         for r in existing[header_idx + 1:]:
@@ -604,20 +584,14 @@ def run():
         new_rows = []
         for r in all_data_rows:
             pid = (r[0] if len(r) > 0 else "").strip()
-            # compute county index from our header definition
-            try:
-                county_idx = all_cols.index("County")
-            except ValueError:
-                county_idx = 5
-            cty = (r[county_idx] if len(r) > county_idx else "").strip()
+            cty = (r[all_cols.index("County")] if len(r) > all_cols.index("County") else "").strip()
             if pid and cty and (cty, pid) not in existing_pairs:
                 new_rows.append(r)
 
+        sheets.prepend_snapshot(all_sheet, all_cols, new_rows)
         if new_rows:
-            sheets.prepend_snapshot(all_sheet, all_cols, new_rows)
             logger.info(f"Updated 'All Data' with {len(new_rows)} new rows")
         else:
-            sheets.prepend_snapshot(all_sheet, all_cols, [])
             logger.info("No new rows for 'All Data'. Snapshot header added.")
 
     logger.info(f"[SUCCESS] Completed. Processed {success_cty}/{len(TARGET_COUNTIES)} counties with {len(standardized)} rows in window.")
