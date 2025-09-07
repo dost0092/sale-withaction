@@ -1,10 +1,9 @@
 name: Sales With Action
 
 on:
-  # Manual run
   workflow_dispatch: {}
-  # Scheduled daily run at 07:05 UTC (adjust as needed)
   schedule:
+    # Daily at 9:30 AM EST → 14:30 UTC
     - cron: "30 14 * * *"
 
 permissions:
@@ -32,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --no-cache-dir -r requirements.txt
 
       - name: Install Playwright browsers
         run: |
@@ -48,7 +47,7 @@ jobs:
   scrape_foreclosures:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [test_credentials]
+    needs: test_credentials
 
     steps:
       - uses: actions/checkout@v4
@@ -67,23 +66,22 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --no-cache-dir -r requirements.txt
 
       - name: Install Playwright browsers
         run: |
           python -m playwright install --with-deps chromium
 
-      - name: Run scraper (attempt 1)
+      - name: Run scraper
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          # Example of repo variable (optional)
           POLITE_DELAY_SECONDS: ${{ vars.POLITE_DELAY_SECONDS }}
         run: |
           echo "▶ Running foreclosure scraper..."
-          python main.py
+          python main_tes.py
 
-      - name: Retry on failure (attempt 2)
+      - name: Retry on failure
         if: failure()
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
