@@ -30,6 +30,13 @@ jobs:
       run: |
         python main.py
 
+    - name: Upload logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: scraper-logs
+        path: foreclosure_scraper.log
+
     - name: Notify on failure
       if: failure()
       uses: actions/github-script@v6
