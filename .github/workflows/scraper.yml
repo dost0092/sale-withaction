@@ -91,4 +91,4 @@ jobs:
         run: |
           echo "⚠ First attempt failed, retrying in 60s..."
           sleep 60
-          python main.py
+          python main_tes.py
