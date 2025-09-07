@@ -12,12 +12,15 @@ permissions:
 jobs:
   test_credentials:
     runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:focal
     timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -32,27 +35,25 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r requirements.txt
-
-      - name: Install Playwright browsers
-        run: |
-          python -m playwright install --with-deps chromium
 
       - name: Run credential test
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-        run: |
-          python test_google_auth.py
+        run: python test_google_auth.py
 
   scrape_foreclosures:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    container:
+      image: mcr.microsoft.com/playwright:focal
+    timeout-minutes: 15
     needs: test_credentials
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -68,11 +69,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r requirements.txt
 
-      - name: Install Playwright browsers
-        run: |
-          python -m playwright install --with-deps chromium
-
-      - name: Run scraper
+      - name: Run foreclosure scraper
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
