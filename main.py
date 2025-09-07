@@ -2,6 +2,7 @@ import httpx
 import time
 import os
 import json
+import re
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs
 from google.oauth2 import service_account
@@ -29,6 +30,7 @@ TARGET_COUNTIES = [
 
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 POLITE_DELAY_SECONDS = 1.5
+BASE_URL = "https://salesweb.civilview.com"
 
 # -----------------------------
 # EST Timezone Helper
@@ -158,79 +160,112 @@ class SheetsClient:
         if requests:
             self.svc.batchUpdate(spreadsheetId=self.spreadsheet_id, body={"requests": requests}).execute()
 
-    def apply_rolling_30_day_filter(self, sheet_name: str, sales_date_column_idx: int = 3):
+    def format_sheet(self, sheet_name: str, num_columns: int):
+        """Apply formatting to make the sheet more readable"""
         sheet_id = self._get_sheet_id(sheet_name)
         if sheet_id is None:
             return
-        all_values = self.get_values(sheet_name, "A:Z")
-        if not all_values or len(all_values) < 3:
-            return
-        header_row_idx = None
-        for i, row in enumerate(all_values):
-            if row and row[0] and "Snapshot for" in row[0]:
-                if i + 1 < len(all_values) and all_values[i + 1]:
-                    header_row_idx = i + 1
-                    break
-        if header_row_idx is None:
-            return
-        sale_dates = []
-        for i in range(header_row_idx + 1, len(all_values)):
-            row = all_values[i]
-            if not row or len(row) <= sales_date_column_idx:
-                continue
-            sale_date = parse_sale_date(row[sales_date_column_idx])
-            if sale_date:
-                sale_dates.append(sale_date)
-        if not sale_dates:
-            return
-        min_sale_date_est = min(sale_dates)
-        start_date = get_est_date()
-        end_date = start_date + timedelta(days=30)
-        requests = [{
-            "setBasicFilter": {
-                "filter": {
+            
+        requests = [
+            # Format header row
+            {
+                "repeatCell": {
                     "range": {
                         "sheetId": sheet_id,
-                        "startRowIndex": header_row_idx,
+                        "startRowIndex": 1,
+                        "endRowIndex": 2,
                         "startColumnIndex": 0,
-                        "endColumnIndex": 10
+                        "endColumnIndex": num_columns
                     },
-                    "criteria": {
-                        sales_date_column_idx: {
-                            "condition": {
-                                "type": "DATE_BETWEEN",
-                                "values": [
-                                    {"userEnteredValue": start_date.strftime("%m/%d/%Y")},
-                                    {"userEnteredValue": end_date.strftime("%m/%d/%Y")}
-                                ]
-                            }
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": {"red": 0.2, "green": 0.4, "blue": 0.6},
+                            "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}
                         }
-                    }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,textFormat)"
+                }
+            },
+            # Format snapshot header
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": num_columns
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9},
+                            "textFormat": {"bold": True, "italic": True}
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,textFormat)"
+                }
+            },
+            # Set column widths
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 0,
+                        "endIndex": num_columns
+                    },
+                    "properties": {"pixelSize": 150},
+                    "fields": "pixelSize"
+                }
+            },
+            # Freeze header row
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet_id,
+                        "gridProperties": {"frozenRowCount": 2}
+                    },
+                    "fields": "gridProperties.frozenRowCount"
                 }
             }
-        }]
-        self.svc.batchUpdate(spreadsheetId=self.spreadsheet_id, body={"requests": requests}).execute()
+        ]
+        
+        try:
+            self.svc.batchUpdate(spreadsheetId=self.spreadsheet_id, body={"requests": requests}).execute()
+        except HttpError as e:
+            print(f"Warning: Could not format sheet {sheet_name}: {e}")
 
     def prepend_snapshot(self, sheet_name: str, header_row, new_rows, new_row_indices=None):
         if not new_rows:
             return
         est_now = get_est_time()
-        snapshot_header = [[f"Snapshot for {est_now.strftime('%A - %Y-%m-%d')}"]]
+        start_date = get_est_date()
+        end_date = start_date + timedelta(days=30)
+        snapshot_header = [[f"Snapshot for {est_now.strftime('%A - %Y-%m-%d')} - Showing sales from {start_date.strftime('%m/%d/%Y')} to {end_date.strftime('%m/%d/%Y')}"]]
+        
         payload = snapshot_header + [header_row] + new_rows + [[""]]
         existing = self.get_values(sheet_name, "A:Z")
         self.clear(sheet_name, "A:Z")
         self.write_values(sheet_name, payload + existing)
+        
+        # Format the sheet
+        self.format_sheet(sheet_name, len(header_row))
+        
         if new_row_indices:
             adjusted_indices = [idx + len(snapshot_header) + 1 for idx in new_row_indices]
             self.highlight_new_rows(sheet_name, adjusted_indices)
-        self.apply_rolling_30_day_filter(sheet_name, sales_date_column_idx=3)
 
     def overwrite_with_snapshot(self, sheet_name: str, header_row, all_rows):
         est_now = get_est_time()
-        snapshot_header = [[f"Snapshot for {est_now.strftime('%A - %Y-%m-%d')}"]]
+        start_date = get_est_date()
+        end_date = start_date + timedelta(days=30)
+        snapshot_header = [[f"Snapshot for {est_now.strftime('%A - %Y-%m-%d')} - Showing sales from {start_date.strftime('%m/%d/%Y')} to {end_date.strftime('%m/%d/%Y')}"]]
+        
         self.clear(sheet_name, "A:Z")
         self.write_values(sheet_name, snapshot_header + [header_row] + all_rows + [[""]])
-        self.apply_rolling_30_day_filter(sheet_name, sales_date_column_idx=3)
+        
+        # Format the sheet
+        self.format_sheet(sheet_name, len(header_row))
         
     def write_summary(self, all_data_rows, new_data_rows):
         sheet_name = "Summary"
@@ -250,8 +285,9 @@ class SheetsClient:
             county_new[row["County"]] = county_new.get(row["County"], 0) + 1
 
         summary_values = [
-            ["Summary Dashboard (Auto-Generated)"],
+            ["Foreclosure Sales Summary Dashboard"],
             [f"Snapshot for {get_est_time().strftime('%A - %Y-%m-%d %H:%M EST')}"],
+            [f"Showing sales from {get_est_date().strftime('%m/%d/%Y')} to {(get_est_date() + timedelta(days=30)).strftime('%m/%d/%Y')}"],
             [""],
             ["Overall Totals"],
             ["Total Properties", total_properties],
@@ -270,6 +306,107 @@ class SheetsClient:
 
         # Write to sheet
         self.write_values(sheet_name, summary_values)
+        
+        # Format summary sheet
+        sheet_id = self._get_sheet_id(sheet_name)
+        if sheet_id:
+            requests = [
+                # Format title
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 0,
+                            "endRowIndex": 1,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 3
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "textFormat": {"bold": True, "fontSize": 16}
+                            }
+                        },
+                        "fields": "userEnteredFormat.textFormat"
+                    }
+                },
+                # Format subtitle
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 3,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 3
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "textFormat": {"italic": True}
+                            }
+                        },
+                        "fields": "userEnteredFormat.textFormat"
+                    }
+                },
+                # Format section headers
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 4,
+                            "endRowIndex": 5,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 3
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "textFormat": {"bold": True}
+                            }
+                        },
+                        "fields": "userEnteredFormat.textFormat"
+                    }
+                },
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 8,
+                            "endRowIndex": 9,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 3
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "textFormat": {"bold": True}
+                            }
+                        },
+                        "fields": "userEnteredFormat.textFormat"
+                    }
+                },
+                # Format table header
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 9,
+                            "endRowIndex": 10,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 3
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": {"red": 0.2, "green": 0.4, "blue": 0.6},
+                                "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}
+                            }
+                        },
+                        "fields": "userEnteredFormat(backgroundColor,textFormat)"
+                    }
+                }
+            ]
+            
+            try:
+                self.svc.batchUpdate(spreadsheetId=self.spreadsheet_id, body={"requests": requests}).execute()
+            except HttpError as e:
+                print(f"Warning: Could not format summary sheet: {e}")
 
 # -----------------------------
 # Scraper helpers
@@ -286,6 +423,34 @@ def extract_property_id_from_href(href: str) -> str:
     except Exception:
         return ""
 
+def extract_approx_judgment(html_content: str) -> str:
+    """Extract Approx Judgment from property details page"""
+    tree = HTMLParser(html_content)
+    
+    # Look for judgment amount in various possible locations
+    judgment_patterns = [
+        # Pattern 1: Look for "Judgment" text followed by amount
+        r'Judgment[^$]*?\$([\d,]+)',
+        # Pattern 2: Look for amounts that might be judgments
+        r'\$([\d,]+)[^$]*?Judgment',
+        # Pattern 3: Common judgment phrases
+        r'Judgment Amount[^$]*?\$([\d,]+)',
+    ]
+    
+    text_content = tree.text()
+    
+    for pattern in judgment_patterns:
+        match = re.search(pattern, text_content, re.IGNORECASE)
+        if match:
+            return f"${match.group(1)}"
+    
+    # If no judgment found, try to find any large dollar amounts
+    large_amounts = re.findall(r'\$([\d,]{4,})', text_content)
+    if large_amounts:
+        return f"${large_amounts[0]}"
+    
+    return "N/A"
+
 # -----------------------------
 # Foreclosure Scraper (httpx version)
 # -----------------------------
@@ -294,7 +459,7 @@ class ForeclosureScraper:
         self.sheets_client = sheets_client
 
     def load_search_page(self, client: httpx.Client, county_id: str):
-        url = f"https://salesweb.civilview.com/Sales/SalesSearch?countyId={county_id}"
+        url = f"{BASE_URL}/Sales/SalesSearch?countyId={county_id}"
         r = client.get(url)
         r.raise_for_status()
         return HTMLParser(r.text)
@@ -306,8 +471,23 @@ class ForeclosureScraper:
             hidden[field] = node.attributes.get("value", "") if node else ""
         return hidden
 
+    def get_property_details(self, client: httpx.Client, property_id: str):
+        """Get additional details including Approx Judgment from property page"""
+        if not property_id:
+            return {"Approx Judgment": "N/A"}
+            
+        url = f"{BASE_URL}/Sales/SaleDetails?PropertyId={property_id}"
+        try:
+            r = client.get(url)
+            r.raise_for_status()
+            judgment = extract_approx_judgment(r.text)
+            return {"Approx Judgment": judgment}
+        except Exception as e:
+            print(f"  Warning: Could not fetch details for property {property_id}: {e}")
+            return {"Approx Judgment": "N/A"}
+
     def post_search_and_extract(self, client: httpx.Client, county_id: str, hidden: dict, county_name: str):
-        url = f"https://salesweb.civilview.com/Sales/SalesSearch?countyId={county_id}"
+        url = f"{BASE_URL}/Sales/SalesSearch?countyId={county_id}"
         payload = {
             "__VIEWSTATE": hidden["__VIEWSTATE"],
             "__VIEWSTATEGENERATOR": hidden["__VIEWSTATEGENERATOR"],
@@ -339,6 +519,15 @@ class ForeclosureScraper:
                 row_dict = dict(zip(headers, cols))
                 row_dict["Property ID"] = property_id
                 row_dict["County"] = county_name
+                
+                # Add Sale Type based on county logic
+                row_dict["Sale Type"] = "Unknown" if county_id == "24" else ""
+                
+                # Get additional details including Approx Judgment
+                if property_id:
+                    details = self.get_property_details(client, property_id)
+                    row_dict.update(details)
+                
                 rows.append(row_dict)
         
         return headers, rows
@@ -392,49 +581,58 @@ def run():
     
     filtered_data_rows = []
     for row in all_data_rows:
-        sale_date_str = row.get("Sale Date", "")
+        sale_date_str = row.get("Sale Date", "") or row.get("Sale date", "") or row.get("sale date", "")
         sale_date = parse_sale_date(sale_date_str)
         if sale_date and today <= sale_date.date() <= thirty_days_later:
             filtered_data_rows.append(row)
+
+    # Define the standard column order we want
+    standard_columns = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment", "Sale Type", "County"]
+    
+    # Reorganize all rows to have the standard column order
+    standardized_rows = []
+    for row in filtered_data_rows:
+        standardized_row = {}
+        for col in standard_columns:
+            standardized_row[col] = row.get(col, "")
+        standardized_rows.append(standardized_row)
 
     # Separate per-county sheets
     for county in TARGET_COUNTIES:
         sheet_name = county['county_name']
         sheets_client.create_sheet_if_missing(sheet_name)
-        county_rows = [r for r in filtered_data_rows if r["County"] == county['county_name']]
+        county_rows = [r for r in standardized_rows if r["County"] == county['county_name']]
         if not county_rows:
             continue
         
         # Convert to list of lists for Google Sheets
-        header_row = list(county_rows[0].keys())
-        county_data = [list(row.values()) for row in county_rows]
+        county_data = [[row[col] for col in standard_columns] for row in county_rows]
         
         # Get existing data to identify new rows
         existing_values = sheets_client.get_values(sheet_name)
-        existing_ids = {r[0] for r in existing_values[1:] if r} if existing_values else set()
+        existing_ids = {r[0] for r in existing_values[2:] if r and len(r) > 0} if existing_values else set()
         
         # Identify new rows
         new_rows = []
         new_row_indices = []
         for i, row in enumerate(county_data):
-            if row[0] not in existing_ids:  # Assuming Property ID is first column
+            if row[0] not in existing_ids:  # Property ID is first column
                 new_rows.append(row)
                 new_row_indices.append(i)
         
-        if not existing_values:
-            sheets_client.overwrite_with_snapshot(sheet_name, header_row, county_data)
+        if not existing_values or len(existing_values) <= 2:  # Only header or empty
+            sheets_client.overwrite_with_snapshot(sheet_name, standard_columns, county_data)
         else:
-            sheets_client.prepend_snapshot(sheet_name, header_row, new_rows, new_row_indices)
+            sheets_client.prepend_snapshot(sheet_name, standard_columns, new_rows, new_row_indices)
 
     # "All Data" sheet
     all_sheet = "All Data"
     sheets_client.create_sheet_if_missing(all_sheet)
-    if filtered_data_rows:
-        all_header = list(filtered_data_rows[0].keys())
-        all_data = [list(row.values()) for row in filtered_data_rows]
+    if standardized_rows:
+        all_data = [[row[col] for col in standard_columns] for row in standardized_rows]
         
         existing_all = sheets_client.get_values(all_sheet)
-        existing_all_ids = {r[0] for r in existing_all[1:] if r} if existing_all else set()
+        existing_all_ids = {r[0] for r in existing_all[2:] if r and len(r) > 0} if existing_all else set()
         
         new_all_rows = []
         new_all_indices = []
@@ -443,14 +641,16 @@ def run():
                 new_all_rows.append(row)
                 new_all_indices.append(i)
         
-        if not existing_all:
-            sheets_client.overwrite_with_snapshot(all_sheet, all_header, all_data)
+        if not existing_all or len(existing_all) <= 2:
+            sheets_client.overwrite_with_snapshot(all_sheet, standard_columns, all_data)
         else:
-            sheets_client.prepend_snapshot(all_sheet, all_header, new_all_rows, new_all_indices)
+            sheets_client.prepend_snapshot(all_sheet, standard_columns, new_all_rows, new_all_indices)
     
     # Summary sheet
-    new_data_rows = [r for r in filtered_data_rows if r["Property ID"] not in existing_all_ids] if existing_all else filtered_data_rows
-    sheets_client.write_summary(filtered_data_rows, new_data_rows)
+    new_data_rows = [r for r in standardized_rows if r["Property ID"] not in existing_all_ids] if existing_all and len(existing_all) > 2 else standardized_rows
+    sheets_client.write_summary(standardized_rows, new_data_rows)
+    
+    print(f"[SUCCESS] Scraping completed. Processed {len(standardized_rows)} records within the 30-day window.")
 
 if __name__ == "__main__":
     run()
