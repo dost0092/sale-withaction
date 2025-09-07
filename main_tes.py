@@ -246,6 +246,44 @@ class SheetsClient:
         self.clear(sheet_name, "A:Z")
         self.write_values(sheet_name, snapshot_header + [header_row] + all_rows + [[""]])
         self.apply_rolling_30_day_filter(sheet_name, sales_date_column_idx=3)
+        def write_summary(self, all_data_rows, new_data_rows):
+        sheet_name = "Summary"
+        self.create_sheet_if_missing(sheet_name)
+        self.clear(sheet_name, "A:Z")
+
+        # --- Build summary ---
+        total_properties = len(all_data_rows)
+        total_new = len(new_data_rows)
+
+        # Count by county
+        county_totals = {}
+        county_new = {}
+        for row in all_data_rows:
+            county_totals[row["County"]] = county_totals.get(row["County"], 0) + 1
+        for row in new_data_rows:
+            county_new[row["County"]] = county_new.get(row["County"], 0) + 1
+
+        summary_values = [
+            ["Summary Dashboard (Auto-Generated)"],
+            [f"Snapshot for {get_est_time().strftime('%A - %Y-%m-%d %H:%M EST')}"],
+            [""],
+            ["Overall Totals"],
+            ["Total Properties", total_properties],
+            ["New Properties (This Run)", total_new],
+            [""],
+            ["Breakdown by County"],
+            ["County", "Total Properties", "New This Run"],
+        ]
+
+        for county, total in county_totals.items():
+            summary_values.append([
+                county,
+                total,
+                county_new.get(county, 0)
+            ])
+
+        # --- Write to sheet ---
+        self.write_values(sheet_name, summary_values)
 
 # -----------------------------
 # Scraper helpers
@@ -417,7 +455,11 @@ async def run():
             sheets_client.overwrite_with_snapshot(all_sheet, all_header, all_new_rows)
         else:
             sheets_client.prepend_snapshot(all_sheet, all_header, all_new_rows, list(range(len(all_new_rows))))
-
+        # Summary sheet
+        sheets_client.write_summary(all_data_rows, [
+            r for r in all_data_rows
+            if (r["County"], r["Property ID"]) not in existing_all_set
+        ])
         await browser.close()
 
 if __name__ == "__main__":

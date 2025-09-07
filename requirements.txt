@@ -1,6 +1,5 @@
-playwright==1.54.0
-pandas>=2.0
-google-api-python-client>=2.70
-google-auth>=2.20
-google-auth-httplib2>=0.1.0
-google-auth-oauthlib>=1.0.0
+httpx==0.27.0
+selectolax==0.3.17
+google-api-python-client==2.151.0
+google-auth==2.34.0
+google-auth-oauthlib==1.2.1
