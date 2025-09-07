@@ -139,9 +139,9 @@ class SheetsClient:
 # ---------------------------------------------
 # Scraper
 # ---------------------------------------------
-def load_search_page(client, county_id):
+async def load_search_page(client, county_id):
     url = f"{BASE_URL}Sales/SalesSearch?countyId={county_id}"
-    r = client.get(url)
+    r = await client.get(url)
     r.raise_for_status()
     return HTMLParser(r.text)
 
@@ -152,7 +152,7 @@ def get_hidden_inputs(tree):
         hidden[field] = node.attributes.get("value", "") if node else ""
     return hidden
 
-def post_search(client, county_id, hidden):
+async def post_search(client, county_id, hidden):
     url = f"{BASE_URL}Sales/SalesSearch?countyId={county_id}"
     payload = {
         "__VIEWSTATE": hidden["__VIEWSTATE"],
@@ -161,7 +161,7 @@ def post_search(client, county_id, hidden):
         "IsOpen": "true",
         "btnSearch": "Search",
     }
-    r = client.post(url, data=payload)
+    r = await client.post(url, data=payload)
     r.raise_for_status()
     tree = HTMLParser(r.text)
 
@@ -172,7 +172,6 @@ def post_search(client, county_id, hidden):
         if cols and len(cols) == len(headers):
             rows.append(dict(zip(headers, cols)))
     return headers, rows
-
 # ---------------------------------------------
 # Orchestration
 # ---------------------------------------------
@@ -187,9 +186,9 @@ async def run():
     all_data = []
     async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
         for county in TARGET_COUNTIES:
-            tree = load_search_page(client, county["county_id"])
+            tree = await load_search_page(client, county["county_id"])
             hidden = get_hidden_inputs(tree)
-            headers, rows = post_search(client, county["county_id"], hidden)
+            headers, rows = await post_search(client, county["county_id"], hidden)
 
             for r in rows:
                 r["County"] = county["county_name"]
