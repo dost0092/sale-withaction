@@ -198,16 +198,38 @@ class SheetsClient:
             # Snapshot row (row 1)
             {
                 "repeatCell": {
-                    "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": num_columns},
-                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.92, "green": 0.92, "blue": 0.92}, "textFormat": {"bold": True, "italic": True}}},
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": num_columns
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": {"red": 0.92, "green": 0.92, "blue": 0.92},
+                            "textFormat": {"bold": True, "italic": True}
+                        }
+                    },
                     "fields": "userEnteredFormat(backgroundColor,textFormat)"
                 }
             },
             # Header row (row 2)
             {
                 "repeatCell": {
-                    "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": num_columns},
-                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.2, "green": 0.4, "blue": 0.6}, "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}},
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": 2,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": num_columns
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": {"red": 0.2, "green": 0.4, "blue": 0.6},
+                            "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}
+                        }
+                    },
                     "fields": "userEnteredFormat(backgroundColor,textFormat)"
                 }
             },
@@ -221,7 +243,12 @@ class SheetsClient:
             # Auto-resize columns
             {
                 "autoResizeDimensions": {
-                    "dimensions": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": num_columns}
+                    "dimensions": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 0,
+                        "endIndex": num_columns
+                    }
                 }
             },
         ]
@@ -231,27 +258,30 @@ class SheetsClient:
             logger.warning(f"Could not format sheet {sheet_name}: {e}")
 
     def detect_header_row_index(self, values):
+        # If first row is "Snapshot for ..." then header is row 1
+        if values and values[0] and str(values[0][0]).strip().lower().startswith("snapshot for"):
+            return 1
+        # Else search for a "Property ID" header in first 10 rows
         for idx, row in enumerate(values[:10]):
             if not row:
                 continue
             first = (row[0] or "").strip().lower().replace(" ", "")
             if first in {"propertyid", "propertyid*"}:
                 return idx
-        if values and values[0] and str(values[0][0]).lower().startswith("snapshot for"):
-            return 1
+        # Fallback to the very top
         return 0
 
     def prepend_snapshot(self, sheet_name: str, header_row, new_rows):
+        # Always prepend a new snapshot row + header, even if new_rows is empty
         existing = self.get_values(sheet_name, "A:Z")
         prefix = [[f"Snapshot for {now_et().strftime('%A - %Y-%m-%d %H:%M %Z')}"]]
-        # Always write a snapshot row + header. If no new rows, we still add a dated snapshot.
         payload = prefix + [header_row] + (new_rows if new_rows else [])
         if existing:
             payload += existing
         self.clear(sheet_name, "A:Z")
         self.write_values(sheet_name, payload, "A1")
         self.format_sheet(sheet_name, len(header_row))
-        logger.info(f"Prepended snapshot to '{sheet_name}' with {len(new_rows)} new rows")
+        logger.info(f"Prepended snapshot to '{sheet_name}' with {len(new_rows) if new_rows else 0} new rows")
 
     def overwrite_with_snapshot(self, sheet_name: str, header_row, all_rows):
         snap = [[f"Snapshot for {now_et().strftime('%A - %Y-%m-%d %H:%M %Z')}"]]
@@ -365,7 +395,7 @@ class ForeclosureScraper:
         return r.text
 
     def extract_rows(self, tree: HTMLParser, county):
-        # read headers
+        # Extract headers (best-effort)
         headers = [norm_text(th.text()) for th in tree.css("table thead th")]
         if not headers:
             thead_tr = tree.css_first("table thead tr")
@@ -394,7 +424,6 @@ class ForeclosureScraper:
                 if "sale" in h and "date" in h and i < len(cols) and not sale_date:
                     sale_date = cols[i]
 
-            # Note: standardize to "Sales Date" (Playwright style)
             rows_out.append({
                 "Property ID": pid or "",
                 "Address": address,
@@ -549,7 +578,7 @@ def run():
             if new_rows:
                 logger.info(f"Updated sheet for {county['county_name']} with {len(new_rows)} new rows")
             else:
-                logger.info(f"No new rows for {county['county_name']}. Snapshot header added.")
+                logger.info(f"No new rows for {county['county_name']}. Snapshot row added.")
 
     # All Data sheet
     all_sheet = "All Data"
@@ -568,7 +597,8 @@ def run():
         # Determine County column index from existing header row if possible
         county_col_idx = 5  # default position in all_cols
         try:
-            county_col_idx = existing[header_idx].index("County")
+            header_row = existing[header_idx]
+            county_col_idx = header_row.index("County")
         except Exception:
             pass
 
@@ -592,7 +622,7 @@ def run():
         if new_rows:
             logger.info(f"Updated 'All Data' with {len(new_rows)} new rows")
         else:
-            logger.info("No new rows for 'All Data'. Snapshot header added.")
+            logger.info("No new rows for 'All Data'. Snapshot row added.")
 
     logger.info(f"[SUCCESS] Completed. Processed {success_cty}/{len(TARGET_COUNTIES)} counties with {len(standardized)} rows in window.")
 
