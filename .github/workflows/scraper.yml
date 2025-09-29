@@ -1,8 +1,6 @@
 name: Foreclosure Scraper
 
 on:
-  schedule:
-    - cron: '30 14 * * *'  # Run daily at 8 AM UTC (3 AM EST)
   workflow_dispatch:  # Allow manual triggers
 
 jobs:
