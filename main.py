@@ -24,18 +24,7 @@ BASE_URL = "https://salesweb.civilview.com"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 TARGET_COUNTIES = [
-    {"county_id": "52", "county_name": "Cape May County, NJ"},
-    {"county_id": "25", "county_name": "Atlantic County, NJ"},
-    {"county_id": "1", "county_name": "Camden County, NJ"},
-    {"county_id": "3", "county_name": "Burlington County, NJ"},
-    {"county_id": "6", "county_name": "Cumberland County, NJ"},
-    {"county_id": "19", "county_name": "Gloucester County, NJ"},
-    {"county_id": "20", "county_name": "Salem County, NJ"},
-    {"county_id": "15", "county_name": "Union County, NJ"},
-    {"county_id": "7", "county_name": "Bergen County, NJ"},
-    {"county_id": "2", "county_name": "Essex County, NJ"},
-    {"county_id": "23", "county_name": "Montgomery County, PA"},
-    {"county_id": "24", "county_name": "New Castle County, DE"},
+    {"county_id": "8", "county_name": "Monmouth County, NJ"}
 ]
 
 POLITE_DELAY_SECONDS = 1.5
@@ -623,8 +612,48 @@ def run():
             logger.info(f"Updated 'All Data' with {len(new_rows)} new rows")
         else:
             logger.info("No new rows for 'All Data'. Snapshot row added.")
+        # -----------------------------
+    # Summary Sheet
+    # -----------------------------
+    summary_sheet = "Summary"
+    sheets.create_sheet_if_missing(summary_sheet)
+
+    # Collect summary stats
+    summary_rows = [["County", "Total Rows (30-day)", "New Rows Added", "Last Updated"]]
+    for county in TARGET_COUNTIES:
+        tab = county["county_name"][:30]
+        county_rows = [r for r in standardized if r["County"] == county["county_name"]]
+
+        total_count = len(county_rows)
+
+        # check new rows count (by comparing to existing)
+        existing = sheets.get_values(tab, "A:Z")
+        header_idx = sheets.detect_header_row_index(existing) if existing else 1
+        existing_ids = set()
+        for r in existing[header_idx + 1:]:
+            if not r:
+                continue
+            pid = (r[0] if len(r) > 0 else "").strip()
+            if pid:
+                existing_ids.add(pid)
+        new_count = sum(1 for r in county_rows if r.get("Property ID", "").strip() not in existing_ids)
+
+        summary_rows.append([
+            county["county_name"],
+            str(total_count),
+            str(new_count),
+            now_et().strftime("%Y-%m-%d %H:%M %Z")
+        ])
+
+    # Overwrite summary each run
+    sheets.clear(summary_sheet, "A:Z")
+    sheets.write_values(summary_sheet, summary_rows, "A1")
+    sheets.format_sheet(summary_sheet, len(summary_rows[0]))
+
+    logger.info(f"Summary sheet updated with {len(TARGET_COUNTIES)} counties")
 
     logger.info(f"[SUCCESS] Completed. Processed {success_cty}/{len(TARGET_COUNTIES)} counties with {len(standardized)} rows in window.")
 
 if __name__ == "__main__":
     run()
+
